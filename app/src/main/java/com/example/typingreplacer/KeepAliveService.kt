@@ -29,7 +29,6 @@ class KeepAliveService : Service() {
             .setContentText("正在后台运行，继续替换文字")
             .setSmallIcon(android.R.drawable.ic_menu_edit)
             .setOngoing(true)
-            .setShowBadge(false)
             .setVisibility(Notification.VISIBILITY_SECRET)
             .build()
 
