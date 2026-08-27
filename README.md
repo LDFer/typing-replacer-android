@@ -55,6 +55,22 @@ app/build/outputs/apk/debug/app-debug.apk
 
 > 本项目没有附 Gradle Wrapper 的二进制 jar，首次打开推荐直接用 Android Studio 自带的 Gradle 完成同步和构建。
 
+## 在 GitHub 上自动构建 APK
+
+仓库已经配置了 GitHub Actions：
+
+```text
+.github/workflows/build-apk.yml
+```
+
+每次推送到 `main`，或在 Actions 页面手动点击 `Run workflow`，都会自动：
+
+1. 安装 JDK 17 和 Gradle 8.7
+2. 执行 `gradle assembleDebug`
+3. 把生成的 APK 作为 Artifact 上传
+
+构建完成后，去仓库的 **Actions** 页面，点进最近一次运行，在 **Artifacts** 里下载 `typing-replacer-apk` 即可。
+
 ## 怎么使用
 
 1. 安装并打开 App。
