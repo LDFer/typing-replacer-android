@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">打字替换</string>
+    <string name="accessibility_service_name">打字替换服务</string>
+    <string name="accessibility_service_description">监听输入框文字变化，按你的规则自动替换后写入。只在你手动开启服务后生效。</string>
+</resources>

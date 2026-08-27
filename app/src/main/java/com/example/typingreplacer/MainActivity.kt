@@ -1,0 +1,209 @@
+package com.example.typingreplacer
+
+import android.app.Activity
+import android.content.Intent
+import android.graphics.Color
+import android.os.Bundle
+import android.provider.Settings
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+
+/**
+ * 主界面：编辑替换规则、测试替换、跳转系统无障碍设置。
+ */
+class MainActivity : Activity() {
+
+    private lateinit var repository: ReplacementRepository
+    private lateinit var ruleContainer: LinearLayout
+    private lateinit var serviceStatus: TextView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        repository = ReplacementRepository(this)
+        setContentView(buildContentView())
+        renderRules()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateServiceStatus()
+    }
+
+    private fun buildContentView(): View {
+        val scroll = ScrollView(this)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 32, 32, 32)
+        }
+        scroll.addView(root)
+
+        root.addView(TextView(this).apply {
+            text = "打字替换（无障碍版）"
+            textSize = 22f
+        })
+
+        root.addView(TextView(this).apply {
+            text = "开启服务后，在任意输入框打字，命中的词会被自动替换后写入。"
+            textSize = 14f
+            setPadding(0, 8, 0, 8)
+        })
+
+        serviceStatus = TextView(this)
+        root.addView(serviceStatus)
+
+        root.addView(Button(this).apply {
+            text = "开启 / 管理无障碍服务"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
+        })
+
+        root.addView(TextView(this).apply {
+            text = "测试区"
+            textSize = 18f
+            setPadding(0, 32, 0, 8)
+        })
+
+        val testInput = EditText(this).apply {
+            hint = "在这里输入：我 今天很开心"
+            minLines = 2
+        }
+        root.addView(testInput)
+
+        root.addView(Button(this).apply {
+            text = "执行替换测试"
+            setOnClickListener {
+                val original = testInput.text.toString()
+                val rules = repository.loadRules()
+                testInput.setText(TextReplacer.replace(original, rules))
+            }
+        })
+
+        root.addView(TextView(this).apply {
+            text = "替换规则"
+            textSize = 18f
+            setPadding(0, 32, 0, 8)
+        })
+
+        ruleContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        root.addView(ruleContainer)
+
+        root.addView(Button(this).apply {
+            text = "添加规则"
+            setOnClickListener {
+                addRuleRow("", "", true)
+            }
+        })
+
+        root.addView(Button(this).apply {
+            text = "保存规则"
+            setOnClickListener {
+                saveRulesFromUi()
+                Toast.makeText(this@MainActivity, "已保存", Toast.LENGTH_SHORT).show()
+            }
+        })
+
+        return scroll
+    }
+
+    private fun renderRules() {
+        ruleContainer.removeAllViews()
+        val rules = repository.loadRules()
+        if (rules.isEmpty()) {
+            ruleContainer.addView(TextView(this).apply { text = "暂无规则" })
+        } else {
+            rules.forEach { addRuleRow(it.source, it.replacement, it.enabled) }
+        }
+    }
+
+    private fun addRuleRow(source: String, replacement: String, enabled: Boolean) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 8, 0, 8)
+        }
+
+        val check = CheckBox(this).apply {
+            isChecked = enabled
+        }
+        row.addView(check)
+
+        val sourceEdit = EditText(this).apply {
+            hint = "原词"
+            setText(source)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        row.addView(sourceEdit)
+
+        row.addView(TextView(this).apply {
+            text = " → "
+            textSize = 18f
+        })
+
+        val replacementEdit = EditText(this).apply {
+            hint = "替换为"
+            setText(replacement)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        row.addView(replacementEdit)
+
+        row.addView(Button(this).apply {
+            text = "删"
+            setOnClickListener {
+                ruleContainer.removeView(row)
+            }
+        })
+
+        ruleContainer.addView(row)
+    }
+
+    private fun saveRulesFromUi() {
+        val rules = mutableListOf<ReplacementRule>()
+        for (i in 0 until ruleContainer.childCount) {
+            val row = ruleContainer.getChildAt(i) as? LinearLayout ?: continue
+            if (row.childCount < 5) continue
+
+            val enabled = (row.getChildAt(0) as? CheckBox)?.isChecked ?: true
+            val source = (row.getChildAt(1) as? EditText)?.text?.toString()?.trim().orEmpty()
+            val replacement = (row.getChildAt(3) as? EditText)?.text?.toString()?.trim().orEmpty()
+
+            if (source.isNotEmpty()) {
+                rules.add(ReplacementRule(source, replacement, enabled))
+            }
+        }
+        repository.saveRules(rules)
+    }
+
+    private fun updateServiceStatus() {
+        val enabled = isReplacementServiceEnabled()
+        serviceStatus.text = if (enabled) {
+            "状态：已开启（正在全局替换）"
+        } else {
+            "状态：未开启，请点击下方按钮去系统设置里开启"
+        }
+        serviceStatus.setTextColor(if (enabled) Color.GREEN else Color.RED)
+    }
+
+    private fun isReplacementServiceEnabled(): Boolean {
+        val enabledServices = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+        ) ?: return false
+
+        val fullName = "$packageName/${GlobalReplaceService::class.java.name}"
+        val shortName = "$packageName/.GlobalReplaceService"
+
+        return enabledServices.split(':').any {
+            it.equals(fullName, ignoreCase = true) || it.equals(shortName, ignoreCase = true)
+        }
+    }
+}
