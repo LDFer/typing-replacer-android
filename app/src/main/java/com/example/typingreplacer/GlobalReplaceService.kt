@@ -21,6 +21,7 @@ class GlobalReplaceService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var lastSet = ""
     private var lastTextEventTime = 0L
+    private var lastRestoreTime = 0L
 
     private val pollRunnable = object : Runnable {
         override fun run() {
@@ -153,8 +154,14 @@ class GlobalReplaceService : AccessibilityService() {
             val isAppend = original.startsWith(lastSet)
             val isDelete = lastSet.startsWith(original)
             if (isDelete) {
-                // 删除了部分内容，锁回去。
-                restoreLocked(node)
+                // 删除了部分内容，尝试锁回去；如果系统不接受，就放弃锁定避免死循环。
+                val now = System.currentTimeMillis()
+                if (now - lastRestoreTime > 500) {
+                    lastRestoreTime = now
+                    restoreLocked(node)
+                } else {
+                    lastSet = original
+                }
                 return
             }
             if (isAppend) {
@@ -186,13 +193,14 @@ class GlobalReplaceService : AccessibilityService() {
     }
 
     private fun writeLocked(node: AccessibilityNodeInfo, text: String) {
-        lastSet = text
-        setNodeText(node, text)
+        val ok = setNodeText(node, text)
+        lastSet = if (ok) text else ""
     }
 
     private fun restoreLocked(node: AccessibilityNodeInfo) {
         if (lastSet.isEmpty()) return
-        setNodeText(node, lastSet)
+        val ok = setNodeText(node, lastSet)
+        if (!ok) lastSet = ""
     }
 
     private fun isLikelySendButton(node: AccessibilityNodeInfo): Boolean {
@@ -224,13 +232,13 @@ class GlobalReplaceService : AccessibilityService() {
         return null
     }
 
-    private fun setNodeText(node: AccessibilityNodeInfo, text: String) {
+    private fun setNodeText(node: AccessibilityNodeInfo, text: String): Boolean {
         val arguments = Bundle().apply {
             putCharSequence(
                 AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
                 text,
             )
         }
-        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
     }
 }
