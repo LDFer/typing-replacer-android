@@ -21,6 +21,7 @@ class GlobalReplaceService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var suppressEvents = false
     private var lastSet = ""
+    private var lastTextEventTime = 0L
 
     private val pollRunnable = object : Runnable {
         override fun run() {
@@ -93,6 +94,7 @@ class GlobalReplaceService : AccessibilityService() {
 
     private fun handleRealtimeMode(event: AccessibilityEvent) {
         if (event.eventType != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) return
+        lastTextEventTime = System.currentTimeMillis()
         if (suppressEvents) return
 
         val node = event.source ?: return
@@ -105,12 +107,10 @@ class GlobalReplaceService : AccessibilityService() {
 
     private fun pollCurrentInput() {
         if (suppressEvents) return
+        // 如果最近有文本变化事件，说明事件驱动已经能工作，轮询只会添乱。
+        if (System.currentTimeMillis() - lastTextEventTime < 500) return
         val root = rootInActiveWindow ?: return
         val pkg = root.packageName?.toString()
-        if (pkg == "com.tencent.mm") {
-            Log.d(TAG, "WX root children=${root.childCount}")
-            debugDump(root, 0)
-        }
         if (pkg == packageName) {
             root.recycle()
             return
@@ -205,21 +205,6 @@ class GlobalReplaceService : AccessibilityService() {
             || text.contains("提交")
             || text.contains("回复")
             || text == "send"
-    }
-
-    private fun debugDump(node: AccessibilityNodeInfo, depth: Int) {
-        if (depth > 10) return
-        val cls = node.className?.toString().orEmpty()
-        val text = node.text?.toString().orEmpty()
-        val id = node.viewIdResourceName.orEmpty()
-        if (node.isEditable || cls.contains("Edit", true) || text.isNotEmpty()) {
-            Log.d(TAG, "WX node depth=$depth class=$cls id=$id editable=${node.isEditable} text=$text")
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            debugDump(child, depth + 1)
-            child.recycle()
-        }
     }
 
     private fun findEditable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
