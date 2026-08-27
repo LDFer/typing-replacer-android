@@ -17,8 +17,10 @@ class KeepAliveService : Service() {
         val channel = NotificationChannel(
             CHANNEL_ID,
             "后台替换保活",
-            NotificationManager.IMPORTANCE_LOW,
-        )
+            NotificationManager.IMPORTANCE_MIN,
+        ).apply {
+            setShowBadge(false)
+        }
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(channel)
 
@@ -27,6 +29,9 @@ class KeepAliveService : Service() {
             .setContentText("正在后台运行，继续替换文字")
             .setSmallIcon(android.R.drawable.ic_menu_edit)
             .setOngoing(true)
+            .setSilent(true)
+            .setShowBadge(false)
+            .setVisibility(Notification.VISIBILITY_SECRET)
             .build()
 
         startForeground(NOTIFICATION_ID, notification)
