@@ -1,6 +1,9 @@
 package com.example.typingreplacer
 
 import android.accessibilityservice.AccessibilityService
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -35,12 +38,33 @@ class GlobalReplaceService : AccessibilityService() {
     private companion object {
         const val TAG = "TypingReplacer"
         const val POLL_INTERVAL = 200L
+        const val NOTIFICATION_ID = 1
+        const val NOTIFICATION_CHANNEL_ID = "typing_replacer_background"
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        startForegroundNotification()
         handler.removeCallbacks(pollRunnable)
         handler.post(pollRunnable)
+    }
+
+    private fun startForegroundNotification() {
+        val channel = NotificationChannel(
+            NOTIFICATION_CHANNEL_ID,
+            "后台替换保活",
+            NotificationManager.IMPORTANCE_LOW,
+        )
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
+
+        val notification = Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("打字替换")
+            .setContentText("正在后台运行，继续替换文字")
+            .setSmallIcon(android.R.drawable.ic_menu_edit)
+            .setOngoing(true)
+            .build()
+        startForeground(NOTIFICATION_ID, notification)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
