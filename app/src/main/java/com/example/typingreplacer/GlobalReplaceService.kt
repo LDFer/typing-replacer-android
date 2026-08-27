@@ -106,7 +106,12 @@ class GlobalReplaceService : AccessibilityService() {
     private fun pollCurrentInput() {
         if (suppressEvents) return
         val root = rootInActiveWindow ?: return
-        if (root.packageName?.toString() == packageName) {
+        val pkg = root.packageName?.toString()
+        if (pkg == "com.tencent.mm") {
+            Log.d(TAG, "WX root children=${root.childCount}")
+            debugDump(root, 0)
+        }
+        if (pkg == packageName) {
             root.recycle()
             return
         }
@@ -200,6 +205,21 @@ class GlobalReplaceService : AccessibilityService() {
             || text.contains("提交")
             || text.contains("回复")
             || text == "send"
+    }
+
+    private fun debugDump(node: AccessibilityNodeInfo, depth: Int) {
+        if (depth > 10) return
+        val cls = node.className?.toString().orEmpty()
+        val text = node.text?.toString().orEmpty()
+        val id = node.viewIdResourceName.orEmpty()
+        if (node.isEditable || cls.contains("Edit", true) || text.isNotEmpty()) {
+            Log.d(TAG, "WX node depth=$depth class=$cls id=$id editable=${node.isEditable} text=$text")
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            debugDump(child, depth + 1)
+            child.recycle()
+        }
     }
 
     private fun findEditable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
