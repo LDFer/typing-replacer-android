@@ -155,19 +155,18 @@ class GlobalReplaceService : AccessibilityService() {
             }
             val isAppend = original.startsWith(lastSet)
             val isDelete = lastSet.startsWith(original)
-            if (!isAppend && !isDelete) {
-                // 用户在中间修改，直接锁回上次内容。
-                restoreLocked(node)
-                return
-            }
             if (isDelete) {
                 // 删除了部分内容，锁回去。
                 restoreLocked(node)
                 return
             }
-            // 允许在替换结果后面继续输入，并重新锁定新的完整内容。
-            writeLocked(node, replaced)
-            return
+            if (isAppend) {
+                // 允许在替换结果后面继续输入，并重新锁定新的完整内容。
+                writeLocked(node, replaced)
+                return
+            }
+            // 完全不同的文本：当作新输入处理，避免旧锁定状态卡住新消息。
+            lastSet = ""
         }
 
         if (replaced == original) {
