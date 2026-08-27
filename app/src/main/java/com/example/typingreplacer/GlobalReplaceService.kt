@@ -19,7 +19,6 @@ import android.view.accessibility.AccessibilityNodeInfo
 class GlobalReplaceService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
-    private var suppressEvents = false
     private var lastSet = ""
     private var lastTextEventTime = 0L
 
@@ -94,11 +93,10 @@ class GlobalReplaceService : AccessibilityService() {
 
     private fun handleRealtimeMode(event: AccessibilityEvent) {
         if (event.eventType != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) return
-        lastTextEventTime = System.currentTimeMillis()
-        if (suppressEvents) return
 
         val node = event.source ?: return
         if (!node.isEditable || node.isPassword) return
+        lastTextEventTime = System.currentTimeMillis()
 
         val original = node.text?.toString() ?: return
         Log.d(TAG, "textEvent pkg=${event.packageName} editable=${node.isEditable} text=$original")
@@ -106,7 +104,6 @@ class GlobalReplaceService : AccessibilityService() {
     }
 
     private fun pollCurrentInput() {
-        if (suppressEvents) return
         // 如果最近有文本变化事件，说明事件驱动已经能工作，轮询只会添乱。
         if (System.currentTimeMillis() - lastTextEventTime < 500) return
         val root = rootInActiveWindow ?: return
@@ -189,23 +186,13 @@ class GlobalReplaceService : AccessibilityService() {
     }
 
     private fun writeLocked(node: AccessibilityNodeInfo, text: String) {
-        suppressEvents = true
-        try {
-            lastSet = text
-            setNodeText(node, text)
-        } finally {
-            handler.postDelayed({ suppressEvents = false }, 150)
-        }
+        lastSet = text
+        setNodeText(node, text)
     }
 
     private fun restoreLocked(node: AccessibilityNodeInfo) {
         if (lastSet.isEmpty()) return
-        suppressEvents = true
-        try {
-            setNodeText(node, lastSet)
-        } finally {
-            handler.postDelayed({ suppressEvents = false }, 150)
-        }
+        setNodeText(node, lastSet)
     }
 
     private fun isLikelySendButton(node: AccessibilityNodeInfo): Boolean {
