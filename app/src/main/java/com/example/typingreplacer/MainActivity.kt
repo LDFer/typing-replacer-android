@@ -119,6 +119,12 @@ class MainActivity : Activity() {
         }
         root.addView(modeGroup)
 
+        val lockCheck = CheckBox(this).apply {
+            text = "锁定替换（替换后不可删除/修改，删除会自动恢复）"
+            isChecked = appSettings.lockReplacement
+        }
+        root.addView(lockCheck)
+
         root.addView(TextView(this).apply {
             text = "替换规则"
             textSize = 18f
@@ -147,6 +153,7 @@ class MainActivity : Activity() {
                     AppSettings.MODE_REALTIME
                 }
                 appSettings.mode = selected
+                appSettings.lockReplacement = lockCheck.isChecked
                 Toast.makeText(this@MainActivity, "已保存", Toast.LENGTH_SHORT).show()
             }
         })

@@ -10,17 +10,22 @@ import android.view.accessibility.AccessibilityNodeInfo
 /**
  * 无障碍服务。
  *
- * - send 模式：只在点击“发送/提交/发布”等按钮时替换输入框，平时不动输入框。
- * - realtime 模式：每次输入变化都立即替换。
+ * - realtime 模式：输入变化时替换；可开启“锁定替换”，让替换后的文字无法被删除/修改。
+ * - send 模式：平时不动输入框，只在点击发送/提交/发布类按钮时替换。
  */
 class GlobalReplaceService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private var suppressEvents = false
+    private var lastSet = ""
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         if (event.packageName?.toString() == packageName) return
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            lastSet = ""
+            return
+        }
 
         val mode = AppSettings(this).mode
         if (mode == AppSettings.MODE_SEND) {
@@ -59,16 +64,67 @@ class GlobalReplaceService : AccessibilityService() {
         val node = event.source ?: return
         if (!node.isEditable || node.isPassword) return
 
+        val settings = AppSettings(this)
         val original = node.text?.toString() ?: return
-        if (original.isEmpty()) return
+
+        if (settings.lockReplacement && lastSet.isNotEmpty() && original.isEmpty()) {
+            // 全部删除时，强制恢复上次替换后的内容。
+            restoreLocked(node)
+            return
+        }
+
+        if (original.isEmpty()) {
+            lastSet = ""
+            return
+        }
 
         val rules = ReplacementRepository(this).loadRules()
         val replaced = TextReplacer.replace(original, rules)
-        if (replaced == original) return
 
+        if (settings.lockReplacement && lastSet.isNotEmpty()) {
+            if (original == lastSet) {
+                return
+            }
+            val isAppend = original.startsWith(lastSet)
+            val isDelete = lastSet.startsWith(original)
+            if (!isAppend && !isDelete) {
+                // 用户在中间修改，直接锁回上次内容。
+                restoreLocked(node)
+                return
+            }
+            if (isDelete) {
+                // 删除了部分内容，锁回去。
+                restoreLocked(node)
+                return
+            }
+            // 允许在替换结果后面继续输入，并重新锁定新的完整内容。
+            writeLocked(node, replaced)
+            return
+        }
+
+        if (replaced == original) {
+            lastSet = original
+            return
+        }
+
+        writeLocked(node, replaced)
+    }
+
+    private fun writeLocked(node: AccessibilityNodeInfo, text: String) {
         suppressEvents = true
         try {
-            setNodeText(node, replaced)
+            lastSet = text
+            setNodeText(node, text)
+        } finally {
+            handler.postDelayed({ suppressEvents = false }, 150)
+        }
+    }
+
+    private fun restoreLocked(node: AccessibilityNodeInfo) {
+        if (lastSet.isEmpty()) return
+        suppressEvents = true
+        try {
+            setNodeText(node, lastSet)
         } finally {
             handler.postDelayed({ suppressEvents = false }, 150)
         }
@@ -115,5 +171,6 @@ class GlobalReplaceService : AccessibilityService() {
 
     override fun onInterrupt() {
         // 无障碍服务被系统中断时没有额外清理工作。
+        lastSet = ""
     }
 }
