@@ -5,8 +5,10 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -80,6 +82,22 @@ class MainActivity : Activity() {
             text = "开启 / 管理无障碍服务"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
+        })
+
+        root.addView(Button(this).apply {
+            text = "允许不限制电池优化"
+            setOnClickListener {
+                val pm = getSystemService(PowerManager::class.java)
+                if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                    Toast.makeText(this@MainActivity, "已经是不限制状态", Toast.LENGTH_SHORT).show()
+                } else {
+                    val intent = Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:$packageName"),
+                    )
+                    startActivity(intent)
+                }
             }
         })
 
