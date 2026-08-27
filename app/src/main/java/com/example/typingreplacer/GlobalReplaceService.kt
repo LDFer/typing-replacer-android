@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -18,6 +19,10 @@ class GlobalReplaceService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var suppressEvents = false
     private var lastSet = ""
+
+    private companion object {
+        const val TAG = "TypingReplacer"
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
@@ -66,6 +71,7 @@ class GlobalReplaceService : AccessibilityService() {
 
         val settings = AppSettings(this)
         val original = node.text?.toString() ?: return
+        Log.d(TAG, "textEvent pkg=${event.packageName} editable=${node.isEditable} text=$original mode=${settings.mode}")
 
         if (settings.lockReplacement && lastSet.isNotEmpty() && original.isEmpty()) {
             // 全部删除时，强制恢复上次替换后的内容。
@@ -80,6 +86,7 @@ class GlobalReplaceService : AccessibilityService() {
 
         val rules = ReplacementRepository(this).loadRules()
         val replaced = TextReplacer.replace(original, rules)
+        Log.d(TAG, "processed original=$original replaced=$replaced lock=${settings.lockReplacement} lastSet=$lastSet")
 
         if (settings.lockReplacement && lastSet.isNotEmpty()) {
             if (original == lastSet) {
