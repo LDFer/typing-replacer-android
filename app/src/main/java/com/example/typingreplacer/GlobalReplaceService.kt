@@ -26,6 +26,7 @@ class GlobalReplaceService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+        Log.d(TAG, "event type=${event.eventType} pkg=${event.packageName}")
         if (event.packageName?.toString() == packageName) return
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             lastSet = ""
