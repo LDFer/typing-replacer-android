@@ -11,6 +11,8 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -21,12 +23,15 @@ import android.widget.Toast
 class MainActivity : Activity() {
 
     private lateinit var repository: ReplacementRepository
+    private lateinit var appSettings: AppSettings
     private lateinit var ruleContainer: LinearLayout
     private lateinit var serviceStatus: TextView
+    private lateinit var modeGroup: RadioGroup
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         repository = ReplacementRepository(this)
+        appSettings = AppSettings(this)
         setContentView(buildContentView())
         renderRules()
     }
@@ -50,7 +55,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "开启服务后，在任意输入框打字，命中的词会被自动替换后写入。"
+            text = "开启服务后，可选择“仅发送时替换”或“实时替换”。仅发送时替换平时不会改输入框，不怕删除后自动补全。"
             textSize = 14f
             setPadding(0, 8, 0, 8)
         })
@@ -87,6 +92,34 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
+            text = "处理模式"
+            textSize = 18f
+            setPadding(0, 32, 0, 8)
+        })
+
+        val rbSend = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "仅发送时替换（推荐）"
+        }
+        val rbRealtime = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "实时替换（输入框会变）"
+        }
+
+        modeGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            addView(rbSend)
+            addView(rbRealtime)
+        }
+
+        if (appSettings.mode == AppSettings.MODE_SEND) {
+            rbSend.isChecked = true
+        } else {
+            rbRealtime.isChecked = true
+        }
+        root.addView(modeGroup)
+
+        root.addView(TextView(this).apply {
             text = "替换规则"
             textSize = 18f
             setPadding(0, 32, 0, 8)
@@ -105,9 +138,15 @@ class MainActivity : Activity() {
         })
 
         root.addView(Button(this).apply {
-            text = "保存规则"
+            text = "保存设置"
             setOnClickListener {
                 saveRulesFromUi()
+                val selected = if (modeGroup.checkedRadioButtonId == rbSend.id) {
+                    AppSettings.MODE_SEND
+                } else {
+                    AppSettings.MODE_REALTIME
+                }
+                appSettings.mode = selected
                 Toast.makeText(this@MainActivity, "已保存", Toast.LENGTH_SHORT).show()
             }
         })
