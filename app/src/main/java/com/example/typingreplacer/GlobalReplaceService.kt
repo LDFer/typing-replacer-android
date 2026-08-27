@@ -128,6 +128,11 @@ class GlobalReplaceService : AccessibilityService() {
     }
 
     private fun processRealtimeText(node: AccessibilityNodeInfo, original: String) {
+        if (isPlaceholder(node, original)) {
+            lastSet = ""
+            return
+        }
+
         val settings = AppSettings(this)
         if (settings.lockReplacement && lastSet.isNotEmpty() && original.isEmpty()) {
             // 全部删除时，强制恢复上次替换后的内容。
@@ -171,6 +176,17 @@ class GlobalReplaceService : AccessibilityService() {
         }
 
         writeLocked(node, replaced)
+    }
+
+    private fun isPlaceholder(node: AccessibilityNodeInfo, text: String): Boolean {
+        val hint = node.hintText?.toString().orEmpty()
+        val trimmed = text.trim()
+        return text == hint
+            || trimmed == "发送消息"
+            || trimmed == "输入消息"
+            || trimmed == "说点什么"
+            || trimmed == "你说点什么..."
+            || trimmed.isEmpty()
     }
 
     private fun writeLocked(node: AccessibilityNodeInfo, text: String) {
