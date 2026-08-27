@@ -13,6 +13,8 @@ import android.view.accessibility.AccessibilityNodeInfo
  *
  * - realtime 模式：输入变化时替换；可开启“锁定替换”，让替换后的文字无法被删除/修改。
  * - send 模式：平时不动输入框，只在点击发送/提交/发布类按钮时替换。
+ *
+ * 除了监听文本变化事件，还会定时轮询当前输入框，兼容部分手机不发送文本变化事件的情况。
  */
 class GlobalReplaceService : AccessibilityService() {
 
@@ -20,8 +22,24 @@ class GlobalReplaceService : AccessibilityService() {
     private var suppressEvents = false
     private var lastSet = ""
 
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            if (AppSettings(this@GlobalReplaceService).mode == AppSettings.MODE_REALTIME) {
+                pollCurrentInput()
+            }
+            handler.postDelayed(this, POLL_INTERVAL)
+        }
+    }
+
     private companion object {
         const val TAG = "TypingReplacer"
+        const val POLL_INTERVAL = 200L
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        handler.removeCallbacks(pollRunnable)
+        handler.post(pollRunnable)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -39,6 +57,16 @@ class GlobalReplaceService : AccessibilityService() {
         } else {
             handleRealtimeMode(event)
         }
+    }
+
+    override fun onInterrupt() {
+        // 无障碍服务被系统中断时没有额外清理工作。
+        lastSet = ""
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacks(pollRunnable)
+        super.onDestroy()
     }
 
     private fun handleSendMode(event: AccessibilityEvent) {
@@ -70,10 +98,32 @@ class GlobalReplaceService : AccessibilityService() {
         val node = event.source ?: return
         if (!node.isEditable || node.isPassword) return
 
-        val settings = AppSettings(this)
         val original = node.text?.toString() ?: return
-        Log.d(TAG, "textEvent pkg=${event.packageName} editable=${node.isEditable} text=$original mode=${settings.mode}")
+        Log.d(TAG, "textEvent pkg=${event.packageName} editable=${node.isEditable} text=$original")
+        processRealtimeText(node, original)
+    }
 
+    private fun pollCurrentInput() {
+        if (suppressEvents) return
+        val root = rootInActiveWindow ?: return
+        if (root.packageName?.toString() == packageName) {
+            root.recycle()
+            return
+        }
+        val input = findEditable(root)
+        root.recycle()
+        if (input == null) return
+
+        try {
+            val original = input.text?.toString() ?: return
+            processRealtimeText(input, original)
+        } finally {
+            input.recycle()
+        }
+    }
+
+    private fun processRealtimeText(node: AccessibilityNodeInfo, original: String) {
+        val settings = AppSettings(this)
         if (settings.lockReplacement && lastSet.isNotEmpty() && original.isEmpty()) {
             // 全部删除时，强制恢复上次替换后的内容。
             restoreLocked(node)
@@ -175,10 +225,5 @@ class GlobalReplaceService : AccessibilityService() {
             )
         }
         node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
-    }
-
-    override fun onInterrupt() {
-        // 无障碍服务被系统中断时没有额外清理工作。
-        lastSet = ""
     }
 }
