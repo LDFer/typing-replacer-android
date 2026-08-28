@@ -30,6 +30,14 @@ class GlobalReplaceService : AccessibilityService() {
     private var listenerRegistered = false
     private var lastWeChatTreeDumpAt = 0L
 
+    // WeChat can emit many source=null window/content events in a few milliseconds.
+    // Keep the text/IME path immediate, but gate noisy fallback scans and preserve
+    // the IME session while WeChat stays the active editor.
+    private var lastWeChatEventAt = 0L
+    private var lastWeChatContentScanAt = 0L
+    private var lastWeChatWindowStateAt = 0L
+    private var lastWeChatWindowId = Int.MIN_VALUE
+
     private val preferenceListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             when (key) {
@@ -68,6 +76,10 @@ class GlobalReplaceService : AccessibilityService() {
 
         session = null
         weChatImeSession = null
+        lastWeChatEventAt = 0L
+        lastWeChatContentScanAt = 0L
+        lastWeChatWindowStateAt = 0L
+        lastWeChatWindowId = Int.MIN_VALUE
         ServiceRuntimeState.markConnected()
         DiagnosticLog.add(
             "SERVICE",
@@ -116,7 +128,9 @@ class GlobalReplaceService : AccessibilityService() {
         if (eventPackage == packageName) return
         ServiceRuntimeState.markEvent(eventPackage)
 
+        val now = System.currentTimeMillis()
         if (eventPackage == WECHAT_PACKAGE) {
+            lastWeChatEventAt = now
             logWeChatEvent(event)
         }
 
@@ -142,17 +156,58 @@ class GlobalReplaceService : AccessibilityService() {
             }
 
             AccessibilityEvent.TYPE_VIEW_FOCUSED,
-            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
+                if (eventPackage == WECHAT_PACKAGE && Build.VERSION.SDK_INT >= 33) {
+                    // Selection events are especially noisy after commitText().
+                    // A real text change is handled synchronously; focus only needs
+                    // a small delayed IME snapshot as a fallback.
+                    if (event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
+                        scheduleFocusedScan(WECHAT_FOCUS_SCAN_DELAY_MS)
+                    }
+                    return
+                }
+                scheduleFocusedScan(35L)
+            }
+
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                if (eventPackage == WECHAT_PACKAGE && Build.VERSION.SDK_INT >= 33) {
+                    if (now - lastWeChatContentScanAt >= WECHAT_CONTENT_SCAN_THROTTLE_MS) {
+                        lastWeChatContentScanAt = now
+                        scheduleFocusedScan(WECHAT_CONTENT_SCAN_DELAY_MS)
+                    }
+                    return
+                }
                 scheduleFocusedScan(35L)
             }
 
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
                 session = null
+
                 if (eventPackage == WECHAT_PACKAGE) {
+                    val duplicateWindowNoise =
+                        event.windowId == lastWeChatWindowId &&
+                            now - lastWeChatWindowStateAt < WECHAT_WINDOW_STATE_DEBOUNCE_MS
+
+                    lastWeChatWindowId = event.windowId
+                    lastWeChatWindowStateAt = now
+
+                    // Do not throw away the InputConnection session merely because
+                    // WeChat rebuilt a window. The editor itself remains valid and
+                    // TEXT_CHANGED/empty/send events are better session boundaries.
+                    if (duplicateWindowNoise) {
+                        DiagnosticLog.add("WX-FLOW", "window state coalesced; IME session preserved")
+                    } else {
+                        DiagnosticLog.add("WX-FLOW", "window changed; IME session preserved")
+                        scheduleFocusedScan(WECHAT_WINDOW_SCAN_DELAY_MS)
+                    }
+                    return
+                }
+
+                // Leaving WeChat is a real boundary. Drop its private lock/session so
+                // a draft in another app can never inherit WeChat's locked text.
+                if (eventPackage != null && eventPackage != WECHAT_PACKAGE) {
                     weChatImeSession = null
-                    DiagnosticLog.add("WX-FLOW", "window changed; sessions cleared")
                 }
                 scheduleFocusedScan(90L)
             }
@@ -177,12 +232,24 @@ class GlobalReplaceService : AccessibilityService() {
                     session?.unlockForSend()
                     weChatImeSession?.unlockForSend()
                 }
-                scheduleFocusedScan(50L)
+
+                if (eventPackage == WECHAT_PACKAGE && Build.VERSION.SDK_INT >= 33) {
+                    scheduleFocusedScan(WECHAT_CLICK_SCAN_DELAY_MS)
+                } else {
+                    scheduleFocusedScan(50L)
+                }
             }
         }
     }
 
     private fun handleWeChatTextChanged(event: AccessibilityEvent) {
+        // Android 13+ WeChat has been observed to expose source=null or an empty
+        // AccessibilityNodeInfo while the accessibility InputConnection is healthy.
+        // Try the proven editor path first and only touch the node tree as fallback.
+        if (Build.VERSION.SDK_INT >= 33 && processWeChatImeTextEvent(event, "text-event-ime")) {
+            return
+        }
+
         val source = event.source
         if (source != null) {
             try {
@@ -205,12 +272,8 @@ class GlobalReplaceService : AccessibilityService() {
             }
         }
 
-        if (processWeChatImeTextEvent(event, "text-event-ime")) {
-            return
-        }
-
-        DiagnosticLog.add("WX-FLOW", "no usable node and IME event path unavailable; scheduling scan")
-        scheduleFocusedScan(35L)
+        DiagnosticLog.add("WX-FLOW", "IME unavailable and no usable node; scheduling fallback scan")
+        scheduleFocusedScan(WECHAT_FALLBACK_SCAN_DELAY_MS)
     }
 
     private fun processWeChatImeTextEvent(
@@ -468,8 +531,20 @@ class GlobalReplaceService : AccessibilityService() {
 
     private fun inspectFocusedInput(reason: String) {
         val activePkg = activeRootPackage()
-        if (activePkg == WECHAT_PACKAGE) {
-            DiagnosticLog.add("WX-SCAN", "begin reason=$reason windows=${windows.size}")
+        val now = System.currentTimeMillis()
+        val weChatLikelyActive =
+            activePkg == WECHAT_PACKAGE ||
+                (Build.VERSION.SDK_INT >= 33 && now - lastWeChatEventAt <= WECHAT_RECENT_ACTIVITY_MS)
+
+        // WeChat first: the InputConnection is the reliable editor surface on
+        // affected versions. Do not walk the accessibility tree unless IME fails.
+        if (weChatLikelyActive && Build.VERSION.SDK_INT >= 33) {
+            DiagnosticLog.add("WX-SCAN", "IME-first reason=$reason activePkg=${activePkg.orEmpty()}")
+            if (processWeChatImeSnapshot("$reason-ime")) {
+                ServiceRuntimeState.markNode("微信已使用 Accessibility InputConnection（$reason）")
+                return
+            }
+            DiagnosticLog.add("WX-SCAN", "IME unavailable; falling back to node tree")
         }
 
         val node = findFocusedEditable()
@@ -488,13 +563,8 @@ class GlobalReplaceService : AccessibilityService() {
             }
         }
 
-        if (activePkg == WECHAT_PACKAGE) {
-            if (processWeChatImeSnapshot("$reason-ime")) {
-                ServiceRuntimeState.markNode("微信节点为空，已使用 Accessibility InputConnection（$reason）")
-                return
-            }
-
-            DiagnosticLog.add("WX-SCAN", "no focused editable; ${windowSummary()}")
+        if (weChatLikelyActive) {
+            DiagnosticLog.add("WX-SCAN", "no focused editable after IME fallback; ${windowSummary()}")
             maybeDumpWeChatTree()
         }
 
@@ -1016,5 +1086,14 @@ class GlobalReplaceService : AccessibilityService() {
         const val MAX_TREE_DEPTH = 8
         const val MIN_EDITABLE_CANDIDATE_SCORE = 80
         const val WECHAT_SYNTHETIC_WINDOW_ID = -1000
+
+        const val WECHAT_CONTENT_SCAN_THROTTLE_MS = 450L
+        const val WECHAT_CONTENT_SCAN_DELAY_MS = 120L
+        const val WECHAT_FOCUS_SCAN_DELAY_MS = 80L
+        const val WECHAT_CLICK_SCAN_DELAY_MS = 100L
+        const val WECHAT_FALLBACK_SCAN_DELAY_MS = 80L
+        const val WECHAT_WINDOW_STATE_DEBOUNCE_MS = 600L
+        const val WECHAT_WINDOW_SCAN_DELAY_MS = 140L
+        const val WECHAT_RECENT_ACTIVITY_MS = 2500L
     }
 }
