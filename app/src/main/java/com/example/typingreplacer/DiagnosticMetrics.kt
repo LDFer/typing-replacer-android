@@ -24,6 +24,10 @@ object DiagnosticMetrics {
     private var textEventCount = 0L
     private var lastTextEventElapsed = 0L
     private var maxTextEventGapMs = 0L
+    private var nullSourceEventCount = 0L
+    private var windowContentEventCount = 0L
+    private var windowStateEventCount = 0L
+    private var windowStateCoalesced = 0L
 
     private var scans = 0L
     private var scanNodeHits = 0L
@@ -68,6 +72,10 @@ object DiagnosticMetrics {
         textEventCount = 0
         lastTextEventElapsed = 0
         maxTextEventGapMs = 0
+        nullSourceEventCount = 0
+        windowContentEventCount = 0
+        windowStateEventCount = 0
+        windowStateCoalesced = 0
         scans = 0
         scanNodeHits = 0
         scanImeHits = 0
@@ -104,17 +112,26 @@ object DiagnosticMetrics {
             "WX-EVENT" -> {
                 val name = message.substringBefore(' ').ifBlank { "UNKNOWN" }
                 eventCounts[name] = (eventCounts[name] ?: 0L) + 1L
-                if (name == "TEXT_CHANGED") {
-                    textEventCount++
-                    if (lastTextEventElapsed > 0L) {
-                        maxTextEventGapMs = max(maxTextEventGapMs, now - lastTextEventElapsed)
+                if (message.contains("source=null")) nullSourceEventCount++
+                when (name) {
+                    "TEXT_CHANGED" -> {
+                        textEventCount++
+                        if (lastTextEventElapsed > 0L) {
+                            maxTextEventGapMs = max(maxTextEventGapMs, now - lastTextEventElapsed)
+                        }
+                        lastTextEventElapsed = now
                     }
-                    lastTextEventElapsed = now
+                    "WINDOW_CONTENT_CHANGED" -> windowContentEventCount++
+                    "WINDOW_STATE_CHANGED", "WINDOWS_CHANGED" -> windowStateEventCount++
                 }
             }
 
+            "WX-FLOW" -> {
+                if (message.contains("window state coalesced")) windowStateCoalesced++
+            }
+
             "WX-SCAN" -> when {
-                message.startsWith("begin ") -> {
+                message.startsWith("begin ") || message.startsWith("IME-first ") -> {
                     scans++
                     scanPending = true
                 }
@@ -215,12 +232,16 @@ object DiagnosticMetrics {
 
     fun summary(): String = synchronized(lock) {
         val elapsed = max(0L, SystemClock.elapsedRealtime() - sessionStartedAtElapsed)
-        val eventRate = if (elapsed <= 0) 0.0 else eventCounts.values.sum() * 1000.0 / elapsed
+        val totalEvents = eventCounts.values.sum()
+        val eventRate = if (elapsed <= 0) 0.0 else totalEvents * 1000.0 / elapsed
+        val nullSourceRate = ratio(nullSourceEventCount, totalEvents)
+        val contentShare = ratio(windowContentEventCount, totalEvents)
         buildString {
             appendLine("=== 诊断统计 ===")
             appendLine("会话时长: ${elapsed}ms")
             appendLine("微信事件: ${eventCounts.entries.joinToString { "${it.key}=${it.value}" }.ifBlank { "无" }}")
             appendLine("事件速率: ${format(eventRate)}/s, TEXT_CHANGED=$textEventCount, 最大相邻TEXT间隔=${maxTextEventGapMs}ms")
+            appendLine("窗口噪声: source=null $nullSourceEventCount/$totalEvents (${format(nullSourceRate * 100)}%), CONTENT占比=${format(contentShare * 100)}%, STATE=$windowStateEventCount, STATE合并=$windowStateCoalesced")
             appendLine("扫描: total=$scans node=$scanNodeHits ime=$scanImeHits miss=$scanMisses")
             appendLine("IME快照: ready=$imeSnapshotReady/$imeSnapshotAttempts surroundingNull=$imeSnapshotSurroundingNull")
             appendLine("IME最后状态: editor=${lastEditorPackage.ifBlank { "-" }} ready=$lastImeReady conn=$lastImeConnection err=${lastImeError.ifBlank { "-" }}")
@@ -230,11 +251,15 @@ object DiagnosticMetrics {
             appendLine("锁定恢复=$lockRestores 发送解锁=$sendUnlocks")
             appendLine("Trace: stored=$traceStored dropped=$traceDropped")
             appendLine("失败分布: ${failureCounts.entries.joinToString { "${it.key}=${it.value}" }.ifBlank { "无" }}")
-            appendLine("优化提示: ${optimizationHintsLocked(eventRate).joinToString("；").ifBlank { "当前未发现明显异常" }}")
+            appendLine("优化提示: ${optimizationHintsLocked(eventRate, nullSourceRate, contentShare).joinToString("；").ifBlank { "当前未发现明显异常" }}")
         }.trimEnd()
     }
 
-    private fun optimizationHintsLocked(eventRate: Double): List<String> {
+    private fun optimizationHintsLocked(
+        eventRate: Double,
+        nullSourceRate: Double,
+        contentShare: Double,
+    ): List<String> {
         val hints = mutableListOf<String>()
         if (imeWriteAttempts > 0 && imeWriteFailure * 20 > imeWriteAttempts) {
             hints += "IME写入失败率>5%，优先检查InputConnection生命周期"
@@ -243,16 +268,22 @@ object DiagnosticMetrics {
             hints += "surrounding-null偏多，应降低发送/窗口切换瞬间的快照频率"
         }
         if (scans >= 5 && scanImeHits * 2 >= scans && scanNodeHits == 0L) {
-            hints += "微信主要依赖IME，可减少Accessibility树扫描"
+            hints += "微信主要依赖IME，可继续减少Accessibility树扫描"
+        }
+        if (nullSourceRate >= 0.5 && contentShare >= 0.4) {
+            hints += "检测到微信source=null窗口事件风暴，应保持内容事件节流和IME优先"
+        }
+        if (windowStateCoalesced >= 2) {
+            hints += "检测到重复WINDOW_STATE_CHANGED，已合并以避免重置IME会话"
         }
         if (eventRate > 20.0) {
-            hints += "事件频率较高，可对WINDOW_CONTENT_CHANGED进一步节流"
+            hints += "事件频率较高，可继续提高WINDOW_CONTENT_CHANGED节流窗口"
         }
         if (imeWriteLatencyCount >= 2 && imeWriteLatencyMaxMs > 250L) {
             hints += "存在>250ms写入延迟，需检查主线程扫描/日志开销"
         }
         if (traceDropped > 0) {
-            hints += "详细Trace过多被采样丢弃，可缩小诊断窗口"
+            hints += "详细Trace存在去重采样，属于正常限流；若关键链缺失再缩短诊断窗口"
         }
         return hints
     }
@@ -308,6 +339,9 @@ object DiagnosticMetrics {
             append(trace.ifBlank { "无" })
         }
     }
+
+    private fun ratio(value: Long, total: Long): Double =
+        if (total <= 0L) 0.0 else value.toDouble() / total.toDouble()
 
     private fun avg(total: Long, count: Long): String =
         if (count <= 0) "0.0" else format(total.toDouble() / count)
