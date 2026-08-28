@@ -10,6 +10,18 @@ import android.annotation.TargetApi
  */
 @TargetApi(33)
 object WeChatImeBridge {
+    data class Snapshot(
+        val ready: Boolean,
+        val editorPackage: String,
+        val inputStarted: Boolean,
+        val hasConnection: Boolean,
+        val text: String?,
+        val offset: Int,
+        val selectionStart: Int,
+        val selectionEnd: Int,
+        val error: String = "",
+    )
+
     data class Result(
         val issued: Boolean,
         val editorPackage: String,
@@ -21,6 +33,68 @@ object WeChatImeBridge {
         val selectionEnd: Int,
         val error: String = "",
     )
+
+    fun snapshot(service: AccessibilityService): Snapshot {
+        return try {
+            val inputMethod = service.inputMethod
+            val editorInfo = inputMethod.currentInputEditorInfo
+            val editorPackage = editorInfo?.packageName.orEmpty()
+            val started = inputMethod.currentInputStarted
+            val connection = inputMethod.currentInputConnection
+
+            if (editorPackage != WECHAT_PACKAGE || !started || connection == null) {
+                return Snapshot(
+                    ready = false,
+                    editorPackage = editorPackage,
+                    inputStarted = started,
+                    hasConnection = connection != null,
+                    text = null,
+                    offset = -1,
+                    selectionStart = -1,
+                    selectionEnd = -1,
+                    error = "editor-not-ready",
+                )
+            }
+
+            val surrounding = connection.getSurroundingText(MAX_SURROUNDING, MAX_SURROUNDING, 0)
+            if (surrounding == null) {
+                return Snapshot(
+                    ready = false,
+                    editorPackage = editorPackage,
+                    inputStarted = started,
+                    hasConnection = true,
+                    text = null,
+                    offset = -1,
+                    selectionStart = -1,
+                    selectionEnd = -1,
+                    error = "surrounding-null",
+                )
+            }
+
+            Snapshot(
+                ready = true,
+                editorPackage = editorPackage,
+                inputStarted = started,
+                hasConnection = true,
+                text = surrounding.text?.toString(),
+                offset = surrounding.offset,
+                selectionStart = surrounding.offset + surrounding.selectionStart,
+                selectionEnd = surrounding.offset + surrounding.selectionEnd,
+            )
+        } catch (t: Throwable) {
+            Snapshot(
+                ready = false,
+                editorPackage = "",
+                inputStarted = false,
+                hasConnection = false,
+                text = null,
+                offset = -1,
+                selectionStart = -1,
+                selectionEnd = -1,
+                error = t.javaClass.simpleName + ":" + (t.message ?: ""),
+            )
+        }
+    }
 
     fun replaceAll(
         service: AccessibilityService,
