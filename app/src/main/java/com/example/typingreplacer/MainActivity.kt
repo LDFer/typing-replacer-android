@@ -446,7 +446,7 @@ class MainActivity : Activity() {
             hint = "原词"
             setText(source)
             textSize = 14f
-            singleLine = true
+            setSingleLine(true)
             setPadding(dp(8), 0, dp(8), 0)
         }
         row.addView(sourceEdit, LinearLayout.LayoutParams(0, dp(48), 1f))
@@ -462,7 +462,7 @@ class MainActivity : Activity() {
             hint = "替换为"
             setText(replacement)
             textSize = 14f
-            singleLine = true
+            setSingleLine(true)
             setPadding(dp(8), 0, dp(8), 0)
         }
         row.addView(replacementEdit, LinearLayout.LayoutParams(0, dp(48), 1f))
