@@ -9,36 +9,32 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.max
 
-/**
- * Privacy-preserving diagnostics kept only in this app process.
- * No chat text is stored: only counters, lengths, timing and coarse states.
- */
+/** Privacy-preserving diagnostics. No input text is stored. */
 object DiagnosticMetrics {
     private val lock = Any()
 
     private var sessionStartedAtWall = System.currentTimeMillis()
     private var sessionStartedAtElapsed = SystemClock.elapsedRealtime()
     private val eventCounts = linkedMapOf<String, Long>()
+    private val packageCounts = linkedMapOf<String, Long>()
     private val failureCounts = linkedMapOf<String, Long>()
+    private val lastTextEventByPackage = linkedMapOf<String, Long>()
 
     private var textEventCount = 0L
-    private var lastTextEventElapsed = 0L
     private var maxTextEventGapMs = 0L
+    private var lastTextEventElapsed = 0L
     private var nullSourceEventCount = 0L
     private var windowContentEventCount = 0L
     private var windowStateEventCount = 0L
-    private var windowStateCoalesced = 0L
 
-    private var scans = 0L
-    private var scanNodeHits = 0L
-    private var scanImeHits = 0L
-    private var scanMisses = 0L
-    private var scanPending = false
+    private var fullEventTextCount = 0L
+    private var deltaRebuiltCount = 0L
+    private var initialEventCount = 0L
+    private var ambiguousEventCount = 0L
 
     private var imeSnapshotAttempts = 0L
     private var imeSnapshotReady = 0L
     private var imeSnapshotSurroundingNull = 0L
-
     private var imeWriteAttempts = 0L
     private var imeWriteSuccess = 0L
     private var imeWriteFailure = 0L
@@ -68,19 +64,19 @@ object DiagnosticMetrics {
         sessionStartedAtWall = System.currentTimeMillis()
         sessionStartedAtElapsed = SystemClock.elapsedRealtime()
         eventCounts.clear()
+        packageCounts.clear()
         failureCounts.clear()
+        lastTextEventByPackage.clear()
         textEventCount = 0
-        lastTextEventElapsed = 0
         maxTextEventGapMs = 0
+        lastTextEventElapsed = 0
         nullSourceEventCount = 0
         windowContentEventCount = 0
         windowStateEventCount = 0
-        windowStateCoalesced = 0
-        scans = 0
-        scanNodeHits = 0
-        scanImeHits = 0
-        scanMisses = 0
-        scanPending = false
+        fullEventTextCount = 0
+        deltaRebuiltCount = 0
+        initialEventCount = 0
+        ambiguousEventCount = 0
         imeSnapshotAttempts = 0
         imeSnapshotReady = 0
         imeSnapshotSurroundingNull = 0
@@ -109,103 +105,163 @@ object DiagnosticMetrics {
     fun ingest(tag: String, message: String) = synchronized(lock) {
         val now = SystemClock.elapsedRealtime()
         when (tag) {
-            "WX-EVENT" -> {
-                val name = message.substringBefore(' ').ifBlank { "UNKNOWN" }
-                eventCounts[name] = (eventCounts[name] ?: 0L) + 1L
-                if (message.contains("source=null")) nullSourceEventCount++
-                when (name) {
-                    "TEXT_CHANGED" -> {
-                        textEventCount++
-                        if (lastTextEventElapsed > 0L) {
-                            maxTextEventGapMs = max(maxTextEventGapMs, now - lastTextEventElapsed)
-                        }
-                        lastTextEventElapsed = now
-                    }
-                    "WINDOW_CONTENT_CHANGED" -> windowContentEventCount++
-                    "WINDOW_STATE_CHANGED", "WINDOWS_CHANGED" -> windowStateEventCount++
-                }
+            "APP-EVENT" -> ingestAppEventLocked(message, now)
+            "APP-IME" -> ingestAppImeLocked(message)
+            "APP-IME-WRITE" -> ingestAppImeWriteLocked(message, now)
+            "APP-NODE-WRITE" -> {
+                nodeWriteAttempts++
+                if (boolValue(message, "setText")) nodeWriteSuccess++ else nodeWriteFailure++
             }
-
-            "WX-FLOW" -> {
-                if (message.contains("window state coalesced")) windowStateCoalesced++
+            "APP-TRANSFORM" -> {
+                if (message.contains("replacement=true")) replacementHits++ else replacementMisses++
             }
+            "APP-LOCK" -> lockRestores++
 
-            "WX-SCAN" -> when {
-                message.startsWith("begin ") || message.startsWith("IME-first ") -> {
-                    scans++
-                    scanPending = true
-                }
-                message.contains("node path found") -> {
-                    scanNodeHits++
-                    scanPending = false
-                }
-                message.startsWith("no focused editable") -> {
-                    scanMisses++
-                    scanPending = false
-                }
-            }
-
-            "WX-IME" -> {
-                when {
-                    message.startsWith("snapshot ") -> {
-                        imeSnapshotAttempts++
-                        val ready = boolValue(message, "ready")
-                        val conn = boolValue(message, "conn")
-                        val editor = stringValue(message, "editor")
-                        val error = stringValue(message, "err")
-                        if (ready) imeSnapshotReady++
-                        if (error == "surrounding-null") imeSnapshotSurroundingNull++
-                        lastEditorPackage = editor
-                        lastImeReady = ready
-                        lastImeConnection = conn
-                        lastImeError = error
-                        if (error.isNotBlank()) recordFailureLocked("ime-snapshot:$error")
-                        if (scanPending && ready) {
-                            scanImeHits++
-                            scanPending = false
-                        }
-                    }
-                    message.startsWith("self-write confirmed") -> selfWriteGuards++
-                }
-            }
-
-            "WX-TRANSFORM" -> {
-                val hit = message.contains("replacement=true")
-                if (hit) replacementHits++ else replacementMisses++
-            }
-
-            "WX-IME-WRITE" -> {
-                imeWriteAttempts++
-                val success = boolValue(message, "issued")
-                val error = stringValue(message, "err")
-                if (success) imeWriteSuccess++ else {
-                    imeWriteFailure++
-                    recordFailureLocked("ime-write:${error.ifBlank { "unknown" }}")
-                }
-                if (lastTextEventElapsed > 0L) {
-                    val latency = max(0L, now - lastTextEventElapsed)
-                    if (latency <= 3000L) {
-                        imeWriteLatencyCount++
-                        imeWriteLatencyTotalMs += latency
-                        imeWriteLatencyMaxMs = max(imeWriteLatencyMaxMs, latency)
-                    }
-                }
-            }
-
+            // Backward-compatible parsing for previous WeChat-only builds.
+            "WX-EVENT" -> ingestLegacyWxEventLocked(message, now)
+            "WX-IME" -> ingestLegacyWxImeLocked(message)
+            "WX-IME-WRITE" -> ingestLegacyWxImeWriteLocked(message, now)
             "WX-WRITE" -> {
                 nodeWriteAttempts++
-                if (message.contains("success")) nodeWriteSuccess++ else {
-                    nodeWriteFailure++
-                    recordFailureLocked("wechat-node-write")
-                }
+                if (message.contains("success")) nodeWriteSuccess++ else nodeWriteFailure++
             }
-
+            "WX-TRANSFORM" -> {
+                if (message.contains("replacement=true")) replacementHits++ else replacementMisses++
+            }
             "WX-LOCK" -> lockRestores++
+
             "FLOW" -> if (message.contains("send-like")) sendUnlocks++
-            "SERVICE" -> {
-                if (message.contains("解绑") || message.contains("销毁") || message.contains("onInterrupt")) {
-                    recordFailureLocked("service:${message.take(48)}")
+            "SERVICE" -> if (
+                message.contains("解绑") || message.contains("销毁") || message.contains("onInterrupt")
+            ) {
+                recordFailureLocked("service:${message.take(64)}")
+            }
+        }
+    }
+
+    private fun ingestAppEventLocked(message: String, now: Long) {
+        val pkg = stringValue(message, "pkg")
+        val type = stringValue(message, "type").ifBlank { "UNKNOWN" }
+        eventCounts[type] = (eventCounts[type] ?: 0L) + 1L
+        if (pkg.isNotBlank()) packageCounts[pkg] = (packageCounts[pkg] ?: 0L) + 1L
+        if (message.contains("source=null")) nullSourceEventCount++
+        when (type) {
+            "TEXT_CHANGED" -> {
+                textEventCount++
+                if (lastTextEventElapsed > 0L) {
+                    maxTextEventGapMs = max(maxTextEventGapMs, now - lastTextEventElapsed)
                 }
+                lastTextEventElapsed = now
+                if (pkg.isNotBlank()) lastTextEventByPackage[pkg] = now
+            }
+            "WINDOW_CONTENT_CHANGED" -> windowContentEventCount++
+            "WINDOW_STATE_CHANGED", "WINDOWS_CHANGED" -> windowStateEventCount++
+        }
+    }
+
+    private fun ingestAppImeLocked(message: String) {
+        when {
+            message.startsWith("snapshot ") -> {
+                imeSnapshotAttempts++
+                val ready = boolValue(message, "ready")
+                val conn = boolValue(message, "conn")
+                val editor = stringValue(message, "editor")
+                val error = stringValue(message, "err")
+                if (ready) imeSnapshotReady++
+                if (error == "surrounding-null") imeSnapshotSurroundingNull++
+                lastEditorPackage = editor
+                lastImeReady = ready
+                lastImeConnection = conn
+                lastImeError = error
+                if (error.isNotBlank()) recordFailureLocked("ime-snapshot:$error")
+            }
+            message.startsWith("uncertain-event ") -> ambiguousEventCount++
+            message.startsWith("event ") -> when (stringValue(message, "mode")) {
+                "full-event" -> fullEventTextCount++
+                "delta-rebuilt" -> deltaRebuiltCount++
+                "initial-event" -> initialEventCount++
+                "ambiguous-event" -> ambiguousEventCount++
+            }
+            message.startsWith("self-write ") -> selfWriteGuards++
+        }
+    }
+
+    private fun ingestAppImeWriteLocked(message: String, now: Long) {
+        imeWriteAttempts++
+        val success = boolValue(message, "issued")
+        val error = stringValue(message, "err")
+        val pkg = stringValue(message, "pkg")
+        val conn = boolValue(message, "conn")
+        lastEditorPackage = stringValue(message, "editor").ifBlank { pkg }
+        lastImeConnection = conn
+        lastImeReady = success
+        lastImeError = error
+        if (success) imeWriteSuccess++ else {
+            imeWriteFailure++
+            recordFailureLocked("ime-write:${error.ifBlank { "unknown" }}")
+        }
+        val lastText = lastTextEventByPackage[pkg] ?: 0L
+        if (lastText > 0L) {
+            val latency = max(0L, now - lastText)
+            if (latency <= 3000L) {
+                imeWriteLatencyCount++
+                imeWriteLatencyTotalMs += latency
+                imeWriteLatencyMaxMs = max(imeWriteLatencyMaxMs, latency)
+            }
+        }
+    }
+
+    private fun ingestLegacyWxEventLocked(message: String, now: Long) {
+        val type = message.substringBefore(' ').ifBlank { "UNKNOWN" }
+        eventCounts[type] = (eventCounts[type] ?: 0L) + 1L
+        packageCounts["com.tencent.mm"] = (packageCounts["com.tencent.mm"] ?: 0L) + 1L
+        if (message.contains("source=null")) nullSourceEventCount++
+        when (type) {
+            "TEXT_CHANGED" -> {
+                textEventCount++
+                if (lastTextEventElapsed > 0L) maxTextEventGapMs = max(maxTextEventGapMs, now - lastTextEventElapsed)
+                lastTextEventElapsed = now
+                lastTextEventByPackage["com.tencent.mm"] = now
+            }
+            "WINDOW_CONTENT_CHANGED" -> windowContentEventCount++
+            "WINDOW_STATE_CHANGED", "WINDOWS_CHANGED" -> windowStateEventCount++
+        }
+    }
+
+    private fun ingestLegacyWxImeLocked(message: String) {
+        if (message.startsWith("snapshot ")) {
+            imeSnapshotAttempts++
+            val ready = boolValue(message, "ready")
+            val conn = boolValue(message, "conn")
+            val editor = stringValue(message, "editor")
+            val error = stringValue(message, "err")
+            if (ready) imeSnapshotReady++
+            if (error == "surrounding-null") imeSnapshotSurroundingNull++
+            lastEditorPackage = editor
+            lastImeReady = ready
+            lastImeConnection = conn
+            lastImeError = error
+            if (error.isNotBlank()) recordFailureLocked("ime-snapshot:$error")
+        } else if (message.startsWith("self-write")) {
+            selfWriteGuards++
+        }
+    }
+
+    private fun ingestLegacyWxImeWriteLocked(message: String, now: Long) {
+        imeWriteAttempts++
+        val success = boolValue(message, "issued")
+        val error = stringValue(message, "err")
+        if (success) imeWriteSuccess++ else {
+            imeWriteFailure++
+            recordFailureLocked("ime-write:${error.ifBlank { "unknown" }}")
+        }
+        val lastText = lastTextEventByPackage["com.tencent.mm"] ?: 0L
+        if (lastText > 0L) {
+            val latency = max(0L, now - lastText)
+            if (latency <= 3000L) {
+                imeWriteLatencyCount++
+                imeWriteLatencyTotalMs += latency
+                imeWriteLatencyMaxMs = max(imeWriteLatencyMaxMs, latency)
             }
         }
     }
@@ -214,8 +270,7 @@ object DiagnosticMetrics {
         if (stored) traceStored++ else traceDropped++
     }
 
-    private fun boolValue(message: String, key: String): Boolean =
-        stringValue(message, key) == "true"
+    private fun boolValue(message: String, key: String): Boolean = stringValue(message, key) == "true"
 
     private fun stringValue(message: String, key: String): String {
         val marker = "$key="
@@ -233,16 +288,17 @@ object DiagnosticMetrics {
     fun summary(): String = synchronized(lock) {
         val elapsed = max(0L, SystemClock.elapsedRealtime() - sessionStartedAtElapsed)
         val totalEvents = eventCounts.values.sum()
-        val eventRate = if (elapsed <= 0) 0.0 else totalEvents * 1000.0 / elapsed
+        val eventRate = if (elapsed <= 0L) 0.0 else totalEvents * 1000.0 / elapsed
         val nullSourceRate = ratio(nullSourceEventCount, totalEvents)
         val contentShare = ratio(windowContentEventCount, totalEvents)
         buildString {
             appendLine("=== 诊断统计 ===")
             appendLine("会话时长: ${elapsed}ms")
-            appendLine("微信事件: ${eventCounts.entries.joinToString { "${it.key}=${it.value}" }.ifBlank { "无" }}")
+            appendLine("涉及 App: ${packageCounts.entries.sortedByDescending { it.value }.joinToString { "${it.key}=${it.value}" }.ifBlank { "无" }}")
+            appendLine("事件类型: ${eventCounts.entries.joinToString { "${it.key}=${it.value}" }.ifBlank { "无" }}")
             appendLine("事件速率: ${format(eventRate)}/s, TEXT_CHANGED=$textEventCount, 最大相邻TEXT间隔=${maxTextEventGapMs}ms")
-            appendLine("窗口噪声: source=null $nullSourceEventCount/$totalEvents (${format(nullSourceRate * 100)}%), CONTENT占比=${format(contentShare * 100)}%, STATE=$windowStateEventCount, STATE合并=$windowStateCoalesced")
-            appendLine("扫描: total=$scans node=$scanNodeHits ime=$scanImeHits miss=$scanMisses")
+            appendLine("窗口/节点可见性: source=null $nullSourceEventCount/$totalEvents (${format(nullSourceRate * 100)}%), CONTENT占比=${format(contentShare * 100)}%, STATE=$windowStateEventCount")
+            appendLine("事件文本判定: full=$fullEventTextCount deltaRebuilt=$deltaRebuiltCount initial=$initialEventCount ambiguous=$ambiguousEventCount")
             appendLine("IME快照: ready=$imeSnapshotReady/$imeSnapshotAttempts surroundingNull=$imeSnapshotSurroundingNull")
             appendLine("IME最后状态: editor=${lastEditorPackage.ifBlank { "-" }} ready=$lastImeReady conn=$lastImeConnection err=${lastImeError.ifBlank { "-" }}")
             appendLine("IME写入: success=$imeWriteSuccess/$imeWriteAttempts fail=$imeWriteFailure event→write avg=${avg(imeWriteLatencyTotalMs, imeWriteLatencyCount)}ms max=${imeWriteLatencyMaxMs}ms")
@@ -261,29 +317,29 @@ object DiagnosticMetrics {
         contentShare: Double,
     ): List<String> {
         val hints = mutableListOf<String>()
+        if (nodeWriteFailure > 0 && imeWriteSuccess > 0) {
+            hints += "检测到Node写入失败但IME回退成功，此设备应长期保留全局InputConnection回退"
+        }
+        if (imeSnapshotAttempts > 0 && imeSnapshotSurroundingNull * 2 >= imeSnapshotAttempts && imeWriteSuccess > 0) {
+            hints += "surroundingText读取不可靠但盲写可用，应避免把surrounding-null视为致命失败"
+        }
         if (imeWriteAttempts > 0 && imeWriteFailure * 20 > imeWriteAttempts) {
-            hints += "IME写入失败率>5%，优先检查InputConnection生命周期"
+            hints += "IME写入失败率>5%，需检查当前编辑器包名和InputConnection生命周期"
         }
-        if (imeSnapshotAttempts > 0 && imeSnapshotSurroundingNull * 10 > imeSnapshotAttempts) {
-            hints += "surrounding-null偏多，应降低发送/窗口切换瞬间的快照频率"
+        if (ambiguousEventCount > fullEventTextCount + deltaRebuiltCount && textEventCount > 0) {
+            hints += "多数TEXT_CHANGED无法可靠重建全文，需要增强事件delta/输入法组合文本处理"
         }
-        if (scans >= 5 && scanImeHits * 2 >= scans && scanNodeHits == 0L) {
-            hints += "微信主要依赖IME，可继续减少Accessibility树扫描"
+        if (textEventCount > 0 && replacementHits == 0L && nodeWriteAttempts == 0L && imeWriteAttempts == 0L) {
+            hints += "收到文本事件但从未进入写入，优先检查规则命中和事件文本语义"
         }
         if (nullSourceRate >= 0.5 && contentShare >= 0.4) {
-            hints += "检测到微信source=null窗口事件风暴，应保持内容事件节流和IME优先"
-        }
-        if (windowStateCoalesced >= 2) {
-            hints += "检测到重复WINDOW_STATE_CHANGED，已合并以避免重置IME会话"
+            hints += "大量事件source=null，应依赖IME通道并保持WINDOW_CONTENT_CHANGED节流"
         }
         if (eventRate > 20.0) {
-            hints += "事件频率较高，可继续提高WINDOW_CONTENT_CHANGED节流窗口"
+            hints += "事件频率较高，可继续扩大内容事件节流窗口"
         }
         if (imeWriteLatencyCount >= 2 && imeWriteLatencyMaxMs > 250L) {
-            hints += "存在>250ms写入延迟，需检查主线程扫描/日志开销"
-        }
-        if (traceDropped > 0) {
-            hints += "详细Trace存在去重采样，属于正常限流；若关键链缺失再缩短诊断窗口"
+            hints += "存在>250ms写入延迟，需检查主线程扫描或ROM调度"
         }
         return hints
     }
@@ -322,7 +378,7 @@ object DiagnosticMetrics {
         }
 
         return buildString {
-            appendLine("Typing Replacer V2 - Diagnostic Report")
+            appendLine("Typing Replacer V2 - Universal Diagnostic Report")
             appendLine("generatedAt=$generated")
             appendLine("sessionStartedAt=$sessionStartedAtWall")
             appendLine("appVersion=$versionName($versionCode)")
@@ -331,11 +387,11 @@ object DiagnosticMetrics {
             appendLine("rules=$ruleCount compatibilityScan=$compatibilityScan lockReplacement=$lockReplacement verboseTrace=$verboseTrace")
             appendLine("batteryOptimizationIgnored=$batteryUnrestricted")
             appendLine("memoryUsed=${usedMb}MB memoryMax=${maxMb}MB")
-            appendLine("privacy=NO_CHAT_TEXT; lengths/status/timing only")
+            appendLine("privacy=NO_CHAT_TEXT; package/length/status/timing only")
             appendLine()
             appendLine(summary())
             appendLine()
-            appendLine("=== 最近关键 Trace（不含聊天正文） ===")
+            appendLine("=== 最近关键 Trace（不含输入正文） ===")
             append(trace.ifBlank { "无" })
         }
     }
@@ -344,7 +400,7 @@ object DiagnosticMetrics {
         if (total <= 0L) 0.0 else value.toDouble() / total.toDouble()
 
     private fun avg(total: Long, count: Long): String =
-        if (count <= 0) "0.0" else format(total.toDouble() / count)
+        if (count <= 0L) "0.0" else format(total.toDouble() / count)
 
     private fun format(value: Double): String = String.format(Locale.US, "%.1f", value)
 }
