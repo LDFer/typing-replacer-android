@@ -98,7 +98,6 @@ object DiagnosticMetrics {
         lastImeError = ""
     }
 
-    /** Parse the existing structured trace so instrumentation stays centralized. */
     fun ingest(tag: String, message: String) = synchronized(lock) {
         val now = SystemClock.elapsedRealtime()
         when (tag) {
@@ -168,7 +167,6 @@ object DiagnosticMetrics {
                 }
                 if (lastTextEventElapsed > 0L) {
                     val latency = max(0L, now - lastTextEventElapsed)
-                    // Ignore unrelated writes after long idle periods.
                     if (latency <= 3000L) {
                         imeWriteLatencyCount++
                         imeWriteLatencyTotalMs += latency
@@ -277,12 +275,26 @@ object DiagnosticMetrics {
         val usedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
         val maxMb = runtime.maxMemory() / (1024 * 1024)
         val generated = SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(Date())
+        val packageInfo = try {
+            context.packageManager.getPackageInfo(context.packageName, 0)
+        } catch (_: Throwable) {
+            null
+        }
+        val versionName = packageInfo?.versionName ?: "?"
+        val versionCode = if (packageInfo == null) {
+            -1L
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageInfo.longVersionCode
+        } else {
+            @Suppress("DEPRECATION")
+            packageInfo.versionCode.toLong()
+        }
 
         return buildString {
             appendLine("Typing Replacer V2 - Diagnostic Report")
             appendLine("generatedAt=$generated")
             appendLine("sessionStartedAt=$sessionStartedAtWall")
-            appendLine("appVersion=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE})")
+            appendLine("appVersion=$versionName($versionCode)")
             appendLine("android=${Build.VERSION.RELEASE} sdk=${Build.VERSION.SDK_INT}")
             appendLine("device=${Build.MANUFACTURER} ${Build.MODEL}")
             appendLine("rules=$ruleCount compatibilityScan=$compatibilityScan lockReplacement=$lockReplacement verboseTrace=$verboseTrace")
