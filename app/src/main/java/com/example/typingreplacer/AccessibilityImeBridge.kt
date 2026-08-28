@@ -4,6 +4,8 @@ import android.accessibilityservice.AccessibilityService
 import android.annotation.TargetApi
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.view.accessibility.AccessibilityEvent
 import java.lang.ref.WeakReference
 
 /**
@@ -17,9 +19,11 @@ import java.lang.ref.WeakReference
  * or progressively accumulated prefixes.
  *
  * Normal replacement writes are queued for a short stability window. Any
- * observed editor movement cancels the stale request. A delete-restore of text
- * that this bridge previously committed is allowed through immediately so lock
- * mode still feels instantaneous.
+ * observed editor movement cancels the stale request. Once the editor has
+ * already been quiet long enough for the service-side composing guard to have
+ * expired, the final replacement is committed immediately instead of paying a
+ * second stability delay. A delete-restore of text that this bridge previously
+ * committed is also allowed through immediately so lock mode stays responsive.
  */
 @TargetApi(33)
 object AccessibilityImeBridge {
@@ -30,7 +34,15 @@ object AccessibilityImeBridge {
     private var lastCommittedPackage = ""
     private var lastCommittedTarget = ""
 
+    private var lastObservedPackage = ""
+    private var lastObservedText = ""
+    private var lastObservedAtElapsed = 0L
+
+    private var nudgeService: WeakReference<AccessibilityService>? = null
+    private var nudgePackage = ""
+
     private val flushRunnable = Runnable { flushPendingWrite() }
+    private val settleNudgeRunnable = Runnable { issueSettleNudge() }
 
     private data class PendingWrite(
         val service: WeakReference<AccessibilityService>,
@@ -122,7 +134,10 @@ object AccessibilityImeBridge {
                 )
 
             val text = surrounding.text?.toString()
-            if (text != null) cancelPendingIfEditorMoved(editorPackage, text)
+            if (text != null) {
+                observeEditor(service, editorPackage, text)
+                cancelPendingIfEditorMoved(editorPackage, text)
+            }
 
             Snapshot(
                 ready = true,
@@ -182,15 +197,14 @@ object AccessibilityImeBridge {
                 )
             }
 
-            // Always make a best-effort validation read. The caller may ask us not
-            // to expose surrounding text in the Result, but we still need this read
-            // to reject a stale AccessibilityEvent whose editor has already moved on.
             val validationSurrounding = try {
                 connection.getSurroundingText(MAX_SURROUNDING, MAX_SURROUNDING, 0)
             } catch (_: Throwable) {
                 null
             }
             val validationText = validationSurrounding?.text?.toString()
+            if (validationText != null) observeEditor(service, editorPackage, validationText)
+
             val editorAhead = validationText != null && validationText != expectedCurrent
             if (editorAhead) {
                 cancelPendingIfEditorMoved(editorPackage, validationText)
@@ -223,9 +237,6 @@ object AccessibilityImeBridge {
             }
             val surroundingLength = if (probeSurrounding) validationText?.length ?: -1 else -1
 
-            // A lock restore targets the exact text that we actually committed before
-            // the user deleted part of it. Keep that path immediate; ordinary rule
-            // replacements are queued until editor state is quiet.
             val immediateRestore = synchronized(queueGuard) {
                 editorPackage == lastCommittedPackage &&
                     target == lastCommittedTarget &&
@@ -240,31 +251,117 @@ object AccessibilityImeBridge {
                     "APP-COMPOSE",
                     "bridge-immediate-lock-restore pkg=$editorPackage currentLen=${expectedCurrent.length} targetLen=${target.length}",
                 )
-                return Result(
-                    issued = true,
-                    editorPackage = editorPackage,
-                    inputStarted = started,
-                    hasConnection = true,
-                    surroundingLength = surroundingLength,
-                    surroundingMatchesExpected = validationText == expectedCurrent,
-                    selectionStart = selectionStart,
-                    selectionEnd = selectionEnd,
+                return successResult(
+                    editorPackage,
+                    started,
+                    surroundingLength,
+                    validationText == expectedCurrent,
+                    selectionStart,
+                    selectionEnd,
+                )
+            }
+
+            // The service already waits out its composing grace period before it
+            // performs the final full-pass replacement. If this exact editor text
+            // has also been unchanged for a substantial interval, committing here
+            // is safe and avoids paying another 900ms bridge delay.
+            val quietMs = observedQuietMs(editorPackage, expectedCurrent)
+            if (validationText == expectedCurrent && quietMs >= FAST_COMMIT_MIN_QUIET_MS) {
+                cancelPending()
+                issueWrite(connection, expectedCurrent, target)
+                rememberCommitted(editorPackage, target)
+                DiagnosticLog.add(
+                    "APP-COMPOSE",
+                    "bridge-fast-stable-commit pkg=$editorPackage quietMs=$quietMs currentLen=${expectedCurrent.length} targetLen=${target.length}",
+                )
+                return successResult(
+                    editorPackage,
+                    started,
+                    surroundingLength,
+                    true,
+                    selectionStart,
+                    selectionEnd,
                 )
             }
 
             queueStableWrite(service, editorPackage, expectedCurrent, target)
-            Result(
-                issued = true,
-                editorPackage = editorPackage,
-                inputStarted = started,
-                hasConnection = true,
-                surroundingLength = surroundingLength,
-                surroundingMatchesExpected = validationText == expectedCurrent,
-                selectionStart = selectionStart,
-                selectionEnd = selectionEnd,
+            successResult(
+                editorPackage,
+                started,
+                surroundingLength,
+                validationText == expectedCurrent,
+                selectionStart,
+                selectionEnd,
             )
         } catch (t: Throwable) {
             failureResult(t.javaClass.simpleName + ":" + (t.message ?: ""))
+        }
+    }
+
+    private fun observeEditor(
+        service: AccessibilityService,
+        packageName: String,
+        text: String,
+    ) {
+        val now = SystemClock.elapsedRealtime()
+        var changed = false
+        synchronized(queueGuard) {
+            if (packageName != lastObservedPackage || text != lastObservedText) {
+                lastObservedPackage = packageName
+                lastObservedText = text
+                lastObservedAtElapsed = now
+                nudgeService = WeakReference(service)
+                nudgePackage = packageName
+                changed = true
+            }
+        }
+
+        if (changed) {
+            mainHandler.removeCallbacks(settleNudgeRunnable)
+            mainHandler.postDelayed(settleNudgeRunnable, SETTLE_NUDGE_DELAY_MS)
+        }
+    }
+
+    private fun observedQuietMs(packageName: String, text: String): Long {
+        val now = SystemClock.elapsedRealtime()
+        return synchronized(queueGuard) {
+            if (packageName == lastObservedPackage && text == lastObservedText) {
+                (now - lastObservedAtElapsed).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+        }
+    }
+
+    private fun issueSettleNudge() {
+        val service: AccessibilityService
+        val packageName: String
+        synchronized(queueGuard) {
+            service = nudgeService?.get() ?: return
+            packageName = nudgePackage
+        }
+        if (packageName.isBlank()) return
+
+        try {
+            // We only need the service to schedule a fresh editor inspection.
+            // VIEW_FOCUSED is used because the service handles it with a short,
+            // unconditional scan delay and it does not mutate editor/session state.
+            val event = AccessibilityEvent.obtain(AccessibilityEvent.TYPE_VIEW_FOCUSED)
+            try {
+                event.packageName = packageName
+                service.onAccessibilityEvent(event)
+                DiagnosticLog.add(
+                    "APP-COMPOSE",
+                    "bridge-settle-nudge pkg=$packageName delayMs=$SETTLE_NUDGE_DELAY_MS",
+                )
+            } finally {
+                event.recycle()
+            }
+        } catch (t: Throwable) {
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "bridge-settle-nudge-error pkg=$packageName err=${t.javaClass.simpleName}",
+            )
         }
     }
 
@@ -330,6 +427,7 @@ object AccessibilityImeBridge {
                 null
             }
             val actual = surrounding?.text?.toString()
+            if (actual != null) observeEditor(service, editorPackage, actual)
             if (actual != null && actual != pending.expectedCurrent) {
                 DiagnosticLog.add(
                     "APP-COMPOSE",
@@ -339,8 +437,6 @@ object AccessibilityImeBridge {
                 return
             }
 
-            // Clear before commit so the resulting AccessibilityEvent cannot cancel
-            // the write we just issued when snapshot() observes the new target.
             synchronized(queueGuard) {
                 if (pendingWrite === pending) pendingWrite = null
             }
@@ -374,6 +470,9 @@ object AccessibilityImeBridge {
         synchronized(queueGuard) {
             lastCommittedPackage = packageName
             lastCommittedTarget = target
+            lastObservedPackage = packageName
+            lastObservedText = target
+            lastObservedAtElapsed = SystemClock.elapsedRealtime()
         }
     }
 
@@ -412,6 +511,24 @@ object AccessibilityImeBridge {
         mainHandler.removeCallbacks(flushRunnable)
     }
 
+    private fun successResult(
+        editorPackage: String,
+        inputStarted: Boolean,
+        surroundingLength: Int,
+        surroundingMatchesExpected: Boolean,
+        selectionStart: Int,
+        selectionEnd: Int,
+    ): Result = Result(
+        issued = true,
+        editorPackage = editorPackage,
+        inputStarted = inputStarted,
+        hasConnection = true,
+        surroundingLength = surroundingLength,
+        surroundingMatchesExpected = surroundingMatchesExpected,
+        selectionStart = selectionStart,
+        selectionEnd = selectionEnd,
+    )
+
     private fun failureResult(error: String): Result = Result(
         issued = false,
         editorPackage = "",
@@ -426,4 +543,6 @@ object AccessibilityImeBridge {
 
     private const val MAX_SURROUNDING = 8192
     private const val STABILITY_DELAY_MS = 900L
+    private const val FAST_COMMIT_MIN_QUIET_MS = 900L
+    private const val SETTLE_NUDGE_DELAY_MS = 1120L
 }
