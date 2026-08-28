@@ -20,10 +20,7 @@ object DiagnosticLog {
         DiagnosticMetrics.ingest(tag, message)
 
         val important = isImportant(tag, message)
-        if (!verbose && !important) {
-            DiagnosticMetrics.recordTraceStored(false)
-            return
-        }
+        if (!verbose && !important) return
 
         val now = System.currentTimeMillis()
         val key = "$tag|$message"
@@ -75,7 +72,8 @@ object DiagnosticLog {
     private fun isImportant(tag: String, message: String): Boolean = when (tag) {
         "SERVICE", "SESSION", "WX-IME-WRITE", "WX-LOCK", "WX-WRITE", "WX-PASTE", "FLOW" -> true
         "WX-TRANSFORM" -> message.contains("replacement=true")
-        "WX-IME" -> message.contains("ready=false") || message.contains("err=") && !message.endsWith("err=")
+        "WX-IME" -> message.contains("ready=false") ||
+            (message.contains("err=") && !message.endsWith("err="))
         else -> false
     }
 }
