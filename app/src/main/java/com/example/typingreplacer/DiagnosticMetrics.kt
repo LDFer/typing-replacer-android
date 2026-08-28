@@ -19,6 +19,7 @@ object DiagnosticMetrics {
     private val packageCounts = linkedMapOf<String, Long>()
     private val failureCounts = linkedMapOf<String, Long>()
     private val lastTextEventByPackage = linkedMapOf<String, Long>()
+    private val lastCompositionSettledByPackage = linkedMapOf<String, Long>()
 
     private var textEventCount = 0L
     private var maxTextEventGapMs = 0L
@@ -41,6 +42,7 @@ object DiagnosticMetrics {
     private var imeWriteLatencyCount = 0L
     private var imeWriteLatencyTotalMs = 0L
     private var imeWriteLatencyMaxMs = 0L
+    private var imeDeferredSettleWrites = 0L
 
     private var nodeWriteAttempts = 0L
     private var nodeWriteSuccess = 0L
@@ -49,6 +51,10 @@ object DiagnosticMetrics {
     private var replacementHits = 0L
     private var replacementMisses = 0L
     private var selfWriteGuards = 0L
+    private var compositionDeferredCount = 0L
+    private var compositionSettledCount = 0L
+    private var compositionLockSuspendedCount = 0L
+    private var lockArmed = 0L
     private var lockRestores = 0L
     private var sendUnlocks = 0L
 
@@ -67,6 +73,7 @@ object DiagnosticMetrics {
         packageCounts.clear()
         failureCounts.clear()
         lastTextEventByPackage.clear()
+        lastCompositionSettledByPackage.clear()
         textEventCount = 0
         maxTextEventGapMs = 0
         lastTextEventElapsed = 0
@@ -86,12 +93,17 @@ object DiagnosticMetrics {
         imeWriteLatencyCount = 0
         imeWriteLatencyTotalMs = 0
         imeWriteLatencyMaxMs = 0
+        imeDeferredSettleWrites = 0
         nodeWriteAttempts = 0
         nodeWriteSuccess = 0
         nodeWriteFailure = 0
         replacementHits = 0
         replacementMisses = 0
         selfWriteGuards = 0
+        compositionDeferredCount = 0
+        compositionSettledCount = 0
+        compositionLockSuspendedCount = 0
+        lockArmed = 0
         lockRestores = 0
         sendUnlocks = 0
         traceStored = 0
@@ -115,7 +127,11 @@ object DiagnosticMetrics {
             "APP-TRANSFORM" -> {
                 if (message.contains("replacement=true")) replacementHits++ else replacementMisses++
             }
-            "APP-LOCK" -> lockRestores++
+            "APP-COMPOSE" -> ingestAppComposeLocked(message, now)
+            "APP-LOCK" -> when {
+                message.startsWith("armed ") -> lockArmed++
+                message.startsWith("restore-") -> lockRestores++
+            }
 
             // Backward-compatible parsing for previous WeChat-only builds.
             "WX-EVENT" -> ingestLegacyWxEventLocked(message, now)
@@ -128,7 +144,12 @@ object DiagnosticMetrics {
             "WX-TRANSFORM" -> {
                 if (message.contains("replacement=true")) replacementHits++ else replacementMisses++
             }
-            "WX-LOCK" -> lockRestores++
+            "WX-LOCK" -> if (
+                message.contains("restore", ignoreCase = true) ||
+                message.contains("delete detected", ignoreCase = true)
+            ) {
+                lockRestores++
+            }
 
             "FLOW" -> if (message.contains("send-like")) sendUnlocks++
             "SERVICE" -> if (
@@ -186,6 +207,18 @@ object DiagnosticMetrics {
         }
     }
 
+    private fun ingestAppComposeLocked(message: String, now: Long) {
+        when {
+            message.startsWith("defer-transform ") -> compositionDeferredCount++
+            message.startsWith("settled ") -> {
+                compositionSettledCount++
+                val pkg = stringValue(message, "pkg")
+                if (pkg.isNotBlank()) lastCompositionSettledByPackage[pkg] = now
+            }
+            message.startsWith("lock-suspended ") -> compositionLockSuspendedCount++
+        }
+    }
+
     private fun ingestAppImeWriteLocked(message: String, now: Long) {
         imeWriteAttempts++
         val success = boolValue(message, "issued")
@@ -200,6 +233,15 @@ object DiagnosticMetrics {
             imeWriteFailure++
             recordFailureLocked("ime-write:${error.ifBlank { "unknown" }}")
         }
+
+        val settledAt = lastCompositionSettledByPackage[pkg] ?: 0L
+        val intentionalDeferredWrite =
+            settledAt > 0L && now - settledAt in 0..SETTLE_WRITE_LATENCY_EXCLUSION_MS
+        if (intentionalDeferredWrite) {
+            imeDeferredSettleWrites++
+            return
+        }
+
         val lastText = lastTextEventByPackage[pkg] ?: 0L
         if (lastText > 0L) {
             val latency = max(0L, now - lastText)
@@ -301,10 +343,11 @@ object DiagnosticMetrics {
             appendLine("事件文本判定: full=$fullEventTextCount deltaRebuilt=$deltaRebuiltCount initial=$initialEventCount ambiguous=$ambiguousEventCount")
             appendLine("IME快照: ready=$imeSnapshotReady/$imeSnapshotAttempts surroundingNull=$imeSnapshotSurroundingNull")
             appendLine("IME最后状态: editor=${lastEditorPackage.ifBlank { "-" }} ready=$lastImeReady conn=$lastImeConnection err=${lastImeError.ifBlank { "-" }}")
-            appendLine("IME写入: success=$imeWriteSuccess/$imeWriteAttempts fail=$imeWriteFailure event→write avg=${avg(imeWriteLatencyTotalMs, imeWriteLatencyCount)}ms max=${imeWriteLatencyMaxMs}ms")
+            appendLine("IME写入: success=$imeWriteSuccess/$imeWriteAttempts fail=$imeWriteFailure responsiveAvg=${avg(imeWriteLatencyTotalMs, imeWriteLatencyCount)}ms responsiveMax=${imeWriteLatencyMaxMs}ms settleDeferred=$imeDeferredSettleWrites")
             appendLine("Node写入: success=$nodeWriteSuccess/$nodeWriteAttempts fail=$nodeWriteFailure")
             appendLine("替换: hit=$replacementHits miss=$replacementMisses selfGuard=$selfWriteGuards")
-            appendLine("锁定恢复=$lockRestores 发送解锁=$sendUnlocks")
+            appendLine("语音/联想: deferred=$compositionDeferredCount settled=$compositionSettledCount lockSuspended=$compositionLockSuspendedCount")
+            appendLine("锁定: armed=$lockArmed restore=$lockRestores 发送解锁=$sendUnlocks")
             appendLine("Trace: stored=$traceStored dropped=$traceDropped")
             appendLine("失败分布: ${failureCounts.entries.joinToString { "${it.key}=${it.value}" }.ifBlank { "无" }}")
             appendLine("优化提示: ${optimizationHintsLocked(eventRate, nullSourceRate, contentShare).joinToString("；").ifBlank { "当前未发现明显异常" }}")
@@ -339,7 +382,10 @@ object DiagnosticMetrics {
             hints += "事件频率较高，可继续扩大内容事件节流窗口"
         }
         if (imeWriteLatencyCount >= 2 && imeWriteLatencyMaxMs > 250L) {
-            hints += "存在>250ms写入延迟，需检查主线程扫描或ROM调度"
+            hints += "存在>250ms实时写入延迟，需检查主线程扫描或ROM调度"
+        }
+        if (compositionDeferredCount > 0 && compositionSettledCount == 0L) {
+            hints += "检测到composing但诊断期内未收敛，可能测试过早结束或输入法持续占用组合态"
         }
         return hints
     }
@@ -403,4 +449,6 @@ object DiagnosticMetrics {
         if (count <= 0L) "0.0" else format(total.toDouble() / count)
 
     private fun format(value: Double): String = String.format(Locale.US, "%.1f", value)
+
+    private const val SETTLE_WRITE_LATENCY_EXCLUSION_MS = 250L
 }
