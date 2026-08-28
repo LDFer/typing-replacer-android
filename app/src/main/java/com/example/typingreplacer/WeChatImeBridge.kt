@@ -36,7 +36,18 @@ object WeChatImeBridge {
 
     fun snapshot(service: AccessibilityService): Snapshot {
         return try {
-            val inputMethod = service.inputMethod
+            val inputMethod = service.inputMethod ?: return Snapshot(
+                ready = false,
+                editorPackage = "",
+                inputStarted = false,
+                hasConnection = false,
+                text = null,
+                offset = -1,
+                selectionStart = -1,
+                selectionEnd = -1,
+                error = "input-method-null",
+            )
+
             val editorInfo = inputMethod.currentInputEditorInfo
             val editorPackage = editorInfo?.packageName.orEmpty()
             val started = inputMethod.currentInputStarted
@@ -102,7 +113,18 @@ object WeChatImeBridge {
         target: String,
     ): Result {
         return try {
-            val inputMethod = service.inputMethod
+            val inputMethod = service.inputMethod ?: return Result(
+                issued = false,
+                editorPackage = "",
+                inputStarted = false,
+                hasConnection = false,
+                surroundingLength = -1,
+                surroundingMatchesEvent = false,
+                selectionStart = -1,
+                selectionEnd = -1,
+                error = "input-method-null",
+            )
+
             val editorInfo = inputMethod.currentInputEditorInfo
             val editorPackage = editorInfo?.packageName.orEmpty()
             val started = inputMethod.currentInputStarted
@@ -132,9 +154,6 @@ object WeChatImeBridge {
             val selectionStart = surrounding?.let { it.offset + it.selectionStart } ?: -1
             val selectionEnd = surrounding?.let { it.offset + it.selectionEnd } ?: -1
 
-            // TYPE_VIEW_TEXT_CHANGED#getText() is the new editor text. Selecting
-            // [0, expectedCurrent.length] lets commitText replace the whole field
-            // even when the AccessibilityNodeInfo for WeChat is an empty shell.
             connection.setSelection(0, expectedCurrent.length)
             connection.commitText(target, 1, null)
 
