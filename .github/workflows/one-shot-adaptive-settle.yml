@@ -1,0 +1,43 @@
+name: One-shot adaptive voice settle patch
+
+on:
+  push:
+    branches:
+      - universal-ime-fallback
+    paths:
+      - .github/workflows/one-shot-adaptive-settle.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: universal-ime-fallback
+          fetch-depth: 0
+
+      - name: Apply adaptive voice settle window
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('app/src/main/java/com/example/typingreplacer/GlobalReplaceService.kt')
+          text = path.read_text(encoding='utf-8')
+          old = 'const val COMPOSITION_GRACE_MS = 1200L'
+          new = 'const val COMPOSITION_GRACE_MS = 650L'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one {old!r}, found {text.count(old)}')
+          path.write_text(text.replace(old, new), encoding='utf-8')
+          PY
+
+      - name: Commit service patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/com/example/typingreplacer/GlobalReplaceService.kt
+          git commit -m 'Reduce voice composition settle latency'
+          git push origin HEAD:universal-ime-fallback
