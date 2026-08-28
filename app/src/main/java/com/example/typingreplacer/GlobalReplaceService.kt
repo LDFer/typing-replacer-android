@@ -2,8 +2,6 @@ package com.example.typingreplacer
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.SharedPreferences
 import android.graphics.Rect
 import android.os.Build
@@ -15,28 +13,29 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 
+/**
+ * Universal replacement service.
+ *
+ * Fast path: editable AccessibilityNodeInfo.
+ * Android 13+ fallback: current accessibility InputConnection for any app.
+ *
+ * IME composing/voice revisions are observed but not rewritten in real time.
+ * Once the editor is stable, one full replacement pass runs and lock mode is
+ * re-armed on the resulting text.
+ */
 class GlobalReplaceService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
-
     private lateinit var repository: ReplacementRepository
     private lateinit var prefs: SharedPreferences
 
     private var cachedRules: List<ReplacementRule> = emptyList()
     private var compatibilityScanEnabled = true
     private var lockReplacementEnabled = false
-    private var session: InputSession? = null
-    private var weChatImeSession: InputSession? = null
+    private var nodeSession: InputSession? = null
+    private var imeSession: InputSession? = null
     private var listenerRegistered = false
-    private var lastWeChatTreeDumpAt = 0L
-
-    // WeChat can emit many source=null window/content events in a few milliseconds.
-    // Keep the text/IME path immediate, but gate noisy fallback scans and preserve
-    // the IME session while WeChat stays the active editor.
-    private var lastWeChatEventAt = 0L
-    private var lastWeChatContentScanAt = 0L
-    private var lastWeChatWindowStateAt = 0L
-    private var lastWeChatWindowId = Int.MIN_VALUE
+    private var lastContentScanAt = 0L
 
     private val preferenceListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -48,15 +47,13 @@ class GlobalReplaceService : AccessibilityService() {
         }
 
     private val delayedScanRunnable = Runnable {
-        inspectFocusedInput(reason = "event-scan")
+        inspectCurrentEditor("event-scan")
     }
 
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             ServiceRuntimeState.markHeartbeat()
-            if (compatibilityScanEnabled) {
-                inspectFocusedInput(reason = "compatibility-scan")
-            }
+            if (compatibilityScanEnabled) inspectCurrentEditor("compatibility-scan")
             handler.postDelayed(this, COMPATIBILITY_SCAN_INTERVAL_MS)
         }
     }
@@ -74,20 +71,17 @@ class GlobalReplaceService : AccessibilityService() {
             listenerRegistered = true
         }
 
-        session = null
-        weChatImeSession = null
-        lastWeChatEventAt = 0L
-        lastWeChatContentScanAt = 0L
-        lastWeChatWindowStateAt = 0L
-        lastWeChatWindowId = Int.MIN_VALUE
+        nodeSession = null
+        imeSession = null
         ServiceRuntimeState.markConnected()
         DiagnosticLog.add(
             "SERVICE",
-            "connected rules=${cachedRules.size} scan=$compatibilityScanEnabled lock=$lockReplacementEnabled sdk=${Build.VERSION.SDK_INT}"
+            "universal connected rules=${cachedRules.size} scan=$compatibilityScanEnabled lock=$lockReplacementEnabled sdk=${Build.VERSION.SDK_INT}"
         )
+
         handler.removeCallbacks(heartbeatRunnable)
         handler.post(heartbeatRunnable)
-        Log.i(TAG, "Accessibility service connected")
+        Log.i(TAG, "Universal accessibility service connected")
     }
 
     private fun configureService() {
@@ -100,7 +94,6 @@ class GlobalReplaceService : AccessibilityService() {
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
                 AccessibilityEvent.TYPE_WINDOWS_CHANGED
-
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
         info.notificationTimeout = 0
 
@@ -109,227 +102,188 @@ class GlobalReplaceService : AccessibilityService() {
                 AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-
         if (Build.VERSION.SDK_INT >= 33) {
             flags = flags or AccessibilityServiceInfo.FLAG_INPUT_METHOD_EDITOR
         }
-
         info.flags = flags
         serviceInfo = info
+
         DiagnosticLog.add(
             "SERVICE",
-            "configured eventTypes=${info.eventTypes} flags=${info.flags} imeFlag=${Build.VERSION.SDK_INT >= 33}"
+            "universal configured eventTypes=${info.eventTypes} flags=${info.flags} imeFlag=${Build.VERSION.SDK_INT >= 33}"
         )
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        val eventPackage = event.packageName?.toString()
-        if (eventPackage == packageName) return
-        ServiceRuntimeState.markEvent(eventPackage)
+        val pkg = event.packageName?.toString().orEmpty()
+        if (pkg.isBlank() || pkg == packageName) return
 
-        val now = System.currentTimeMillis()
-        if (eventPackage == WECHAT_PACKAGE) {
-            lastWeChatEventAt = now
-            logWeChatEvent(event)
-        }
+        ServiceRuntimeState.markEvent(pkg)
+        logEvent(pkg, event)
 
         when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
-                if (eventPackage == WECHAT_PACKAGE) {
-                    handleWeChatTextChanged(event)
-                    return
-                }
-
-                val source = event.source
-                if (source != null) {
-                    try {
-                        if (isEditableTarget(source)) {
-                            processNode(source, event, "text-event")
-                            return
-                        }
-                    } finally {
-                        source.recycle()
-                    }
-                }
-                scheduleFocusedScan(35L)
+                if (handleTextChanged(pkg, event)) return
+                scheduleScan(TEXT_FALLBACK_SCAN_DELAY_MS)
             }
 
-            AccessibilityEvent.TYPE_VIEW_FOCUSED,
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> scheduleScan(FOCUS_SCAN_DELAY_MS)
+
             AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
-                if (eventPackage == WECHAT_PACKAGE && Build.VERSION.SDK_INT >= 33) {
-                    // Selection events are especially noisy after commitText().
-                    // A real text change is handled synchronously; focus only needs
-                    // a small delayed IME snapshot as a fallback.
-                    if (event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
-                        scheduleFocusedScan(WECHAT_FOCUS_SCAN_DELAY_MS)
-                    }
-                    return
-                }
-                scheduleFocusedScan(35L)
+                // No scan: selection churn is especially noisy during composing.
             }
 
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                if (eventPackage == WECHAT_PACKAGE && Build.VERSION.SDK_INT >= 33) {
-                    if (now - lastWeChatContentScanAt >= WECHAT_CONTENT_SCAN_THROTTLE_MS) {
-                        lastWeChatContentScanAt = now
-                        scheduleFocusedScan(WECHAT_CONTENT_SCAN_DELAY_MS)
-                    }
-                    return
+                val now = System.currentTimeMillis()
+                if (now - lastContentScanAt >= CONTENT_SCAN_THROTTLE_MS) {
+                    lastContentScanAt = now
+                    scheduleScan(CONTENT_SCAN_DELAY_MS)
                 }
-                scheduleFocusedScan(35L)
             }
 
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
-                session = null
-
-                if (eventPackage == WECHAT_PACKAGE) {
-                    val duplicateWindowNoise =
-                        event.windowId == lastWeChatWindowId &&
-                            now - lastWeChatWindowStateAt < WECHAT_WINDOW_STATE_DEBOUNCE_MS
-
-                    lastWeChatWindowId = event.windowId
-                    lastWeChatWindowStateAt = now
-
-                    // Do not throw away the InputConnection session merely because
-                    // WeChat rebuilt a window. The editor itself remains valid and
-                    // TEXT_CHANGED/empty/send events are better session boundaries.
-                    if (duplicateWindowNoise) {
-                        DiagnosticLog.add("WX-FLOW", "window state coalesced; IME session preserved")
-                    } else {
-                        DiagnosticLog.add("WX-FLOW", "window changed; IME session preserved")
-                        scheduleFocusedScan(WECHAT_WINDOW_SCAN_DELAY_MS)
-                    }
-                    return
-                }
-
-                // Leaving WeChat is a real boundary. Drop its private lock/session so
-                // a draft in another app can never inherit WeChat's locked text.
-                if (eventPackage != null && eventPackage != WECHAT_PACKAGE) {
-                    weChatImeSession = null
-                }
-                scheduleFocusedScan(90L)
+                nodeSession = null
+                if (imeSession?.key?.packageName != pkg) imeSession = null
+                scheduleScan(WINDOW_SCAN_DELAY_MS)
             }
 
             AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                val clicked = event.source
-                var sendLike = false
-                if (clicked != null) {
-                    try {
-                        sendLike = isLikelySendButton(clicked)
-                    } finally {
-                        clicked.recycle()
-                    }
+                if (isLikelySendEvent(event)) {
+                    nodeSession?.unlockForSend()
+                    imeSession?.unlockForSend()
+                    DiagnosticLog.add("FLOW", "send-like click pkg=$pkg")
                 }
-
-                if (!sendLike && eventPackage == WECHAT_PACKAGE) {
-                    sendLike = isLikelySendEvent(event)
-                }
-
-                if (sendLike) {
-                    DiagnosticLog.add("FLOW", "send-like click pkg=$eventPackage")
-                    session?.unlockForSend()
-                    weChatImeSession?.unlockForSend()
-                }
-
-                if (eventPackage == WECHAT_PACKAGE && Build.VERSION.SDK_INT >= 33) {
-                    scheduleFocusedScan(WECHAT_CLICK_SCAN_DELAY_MS)
-                } else {
-                    scheduleFocusedScan(50L)
-                }
+                scheduleScan(CLICK_SCAN_DELAY_MS)
             }
         }
     }
 
-    private fun handleWeChatTextChanged(event: AccessibilityEvent) {
-        // Android 13+ WeChat has been observed to expose source=null or an empty
-        // AccessibilityNodeInfo while the accessibility InputConnection is healthy.
-        // Try the proven editor path first and only touch the node tree as fallback.
-        if (Build.VERSION.SDK_INT >= 33 && processWeChatImeTextEvent(event, "text-event-ime")) {
-            return
-        }
-
+    private fun handleTextChanged(pkg: String, event: AccessibilityEvent): Boolean {
         val source = event.source
         if (source != null) {
             try {
-                val refreshed = try {
-                    source.refresh()
-                } catch (_: Throwable) {
-                    false
-                }
-                DiagnosticLog.add(
-                    "WX-FLOW",
-                    "text source refresh=$refreshed ${nodeSummary(source)}"
-                )
                 if (isEditableTarget(source)) {
-                    DiagnosticLog.add("WX-FLOW", "text-event using node path")
-                    processNode(source, event, "text-event")
-                    return
+                    DiagnosticLog.add("APP-NODE", "text-event pkg=$pkg ${nodeSummary(source)}")
+                    if (processNode(source, event, "text-event")) return true
                 }
             } finally {
                 source.recycle()
             }
         }
 
-        DiagnosticLog.add("WX-FLOW", "IME unavailable and no usable node; scheduling fallback scan")
-        scheduleFocusedScan(WECHAT_FALLBACK_SCAN_DELAY_MS)
+        return Build.VERSION.SDK_INT >= 33 &&
+            processImeEvent(pkg, event, "text-event-ime")
     }
 
-    private fun processWeChatImeTextEvent(
+    private fun processImeEvent(
+        pkg: String,
         event: AccessibilityEvent,
         reason: String,
     ): Boolean {
-        if (Build.VERSION.SDK_INT < 33) {
-            DiagnosticLog.add("WX-IME", "unsupported sdk=${Build.VERSION.SDK_INT}")
+        if (Build.VERSION.SDK_INT < 33) return false
+
+        val activeSession = getImeSession(pkg, event.windowId)
+        val derived = deriveCurrentText(event)
+
+        if (derived == null) {
+            updateCompositionState(pkg, event, activeSession)
+            DiagnosticLog.add(
+                "APP-IME",
+                "event-text-unavailable pkg=$pkg beforeLen=${event.beforeText?.length ?: -1}"
+            )
+            return processImeSnapshot(pkg, "$reason-snapshot")
+        }
+
+        if (!derived.confident) {
+            updateCompositionState(pkg, event, activeSession)
+            val snapshot = AccessibilityImeBridge.snapshot(this, pkg)
+            DiagnosticLog.add(
+                "APP-IME",
+                "uncertain-event pkg=$pkg mode=${derived.mode} rawLen=${derived.rawLength} snapshotReady=${snapshot.ready} conn=${snapshot.hasConnection} err=${snapshot.error}"
+            )
+            if (snapshot.ready && snapshot.text != null) {
+                return processImeCurrent(
+                    pkg = pkg,
+                    current = snapshot.text,
+                    event = null,
+                    reason = "$reason-snapshot-confirmed",
+                    activeSession = activeSession,
+                )
+            }
             return false
         }
 
-        val current = event.text.firstOrNull()?.toString()
-        if (current == null) {
-            DiagnosticLog.add(
-                "WX-IME",
-                "event.text missing count=${event.text.size} beforeLen=${event.beforeText?.length ?: -1}"
-            )
-            return processWeChatImeSnapshot(reason = "$reason-snapshot")
-        }
-
         DiagnosticLog.add(
-            "WX-IME",
-            "event text available len=${current.length} beforeLen=${event.beforeText?.length ?: -1} from=${event.fromIndex} add=${event.addedCount} remove=${event.removedCount}"
+            "APP-IME",
+            "event pkg=$pkg mode=${derived.mode} len=${derived.text.length} beforeLen=${event.beforeText?.length ?: -1} from=${event.fromIndex} add=${event.addedCount} remove=${event.removedCount}"
         )
-
-        val activeSession = getWeChatImeSession(event.windowId)
-        return processWeChatImeCurrent(
-            current = current,
+        return processImeCurrent(
+            pkg = pkg,
+            current = derived.text,
             event = event,
             reason = reason,
             activeSession = activeSession,
         )
     }
 
-    private fun processWeChatImeSnapshot(reason: String): Boolean {
+    private fun deriveCurrentText(event: AccessibilityEvent): DerivedText? {
+        val raw = event.text.firstOrNull()?.toString() ?: return null
+        val before = event.beforeText?.toString()
+        val from = event.fromIndex
+        val added = event.addedCount
+        val removed = event.removedCount
+
+        if (before != null && from >= 0 && added >= 0 && removed >= 0) {
+            val removalEnd = from + removed
+            val expectedLength = before.length - removed + added
+            if (from <= before.length && removalEnd <= before.length) {
+                if (raw.length == expectedLength) {
+                    return DerivedText(raw, true, "full-event", raw.length)
+                }
+                if (raw.length == added) {
+                    val rebuilt = buildString(expectedLength.coerceAtLeast(0)) {
+                        append(before, 0, from)
+                        append(raw)
+                        append(before, removalEnd, before.length)
+                    }
+                    if (rebuilt.length == expectedLength) {
+                        return DerivedText(rebuilt, true, "delta-rebuilt", raw.length)
+                    }
+                }
+            }
+        }
+
+        if (before == null && from == 0 && removed <= 0 && added >= 0 && raw.length == added) {
+            return DerivedText(raw, true, "initial-event", raw.length)
+        }
+
+        return DerivedText(raw, false, "ambiguous-event", raw.length)
+    }
+
+    private fun processImeSnapshot(pkg: String?, reason: String): Boolean {
         if (Build.VERSION.SDK_INT < 33) return false
 
-        val snapshot = WeChatImeBridge.snapshot(this)
+        val snapshot = AccessibilityImeBridge.snapshot(this, pkg)
         DiagnosticLog.add(
-            "WX-IME",
-            "snapshot ready=${snapshot.ready} editor=${snapshot.editorPackage} started=${snapshot.inputStarted} conn=${snapshot.hasConnection} len=${snapshot.text?.length ?: -1} offset=${snapshot.offset} sel=${snapshot.selectionStart}..${snapshot.selectionEnd} err=${snapshot.error}"
+            "APP-IME",
+            "snapshot expected=${pkg.orEmpty()} editor=${snapshot.editorPackage} ready=${snapshot.ready} started=${snapshot.inputStarted} conn=${snapshot.hasConnection} len=${snapshot.text?.length ?: -1} sel=${snapshot.selectionStart}..${snapshot.selectionEnd} err=${snapshot.error}"
         )
+        if (!snapshot.ready || snapshot.text == null) return false
+        if (snapshot.editorPackage == packageName || snapshot.editorPackage.isBlank()) return false
 
-        if (!snapshot.ready || snapshot.editorPackage != WECHAT_PACKAGE) return false
-        val current = snapshot.text ?: return false
-
-        val activeSession = getWeChatImeSession(WECHAT_SYNTHETIC_WINDOW_ID)
-        return processWeChatImeCurrent(
-            current = current,
+        return processImeCurrent(
+            pkg = snapshot.editorPackage,
+            current = snapshot.text,
             event = null,
             reason = reason,
-            activeSession = activeSession,
+            activeSession = getImeSession(snapshot.editorPackage, IME_SYNTHETIC_WINDOW_ID),
         )
     }
 
-    private fun processWeChatImeCurrent(
+    private fun processImeCurrent(
+        pkg: String,
         current: String,
         event: AccessibilityEvent?,
         reason: String,
@@ -341,53 +295,203 @@ class GlobalReplaceService : AccessibilityService() {
             now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
             current == activeSession.lastWritten
         ) {
-            DiagnosticLog.add("WX-IME", "self-write confirmed len=${current.length}")
+            DiagnosticLog.add("APP-IME", "self-write pkg=$pkg len=${current.length}")
             return true
+        }
+
+        val composing = updateCompositionState(pkg, event, activeSession)
+
+        if (composing) {
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "defer-transform pkg=$pkg len=${current.length} pending=${activeSession.compositionPending}"
+            )
+            return true
+        }
+
+        val settlingComposition = activeSession.compositionPending
+        if (settlingComposition) {
+            activeSession.compositionPending = false
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "settled pkg=$pkg len=${current.length}; full-pass"
+            )
         }
 
         if (current.isEmpty()) {
-            if (
-                lockReplacementEnabled &&
-                activeSession.lockActive &&
-                activeSession.lockedText.isNotEmpty() &&
-                now > activeSession.allowClearUntil
-            ) {
+            if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
+                val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
                 DiagnosticLog.add(
-                    "WX-LOCK",
-                    "IME empty -> restore locked len=${activeSession.lockedText.length}"
+                    "APP-LOCK",
+                    "restore-empty pkg=$pkg restoreLen=${restore.length}"
                 )
-                return writeWeChatIme(
-                    current = current,
-                    target = activeSession.lockedText,
-                    reason = "lock-restore-empty-ime",
-                    activeSession = activeSession,
-                )
+                return writeIme(pkg, current, restore, "lock-restore-empty-ime", activeSession)
             }
 
             activeSession.lastWritten = ""
-            activeSession.lockedText = ""
-            activeSession.lockActive = false
-            DiagnosticLog.add("WX-IME", "empty accepted / session unlocked")
+            activeSession.clearLock()
             return true
         }
 
-        if (
-            lockReplacementEnabled &&
-            activeSession.lockActive &&
-            activeSession.lastWritten.isNotEmpty() &&
-            current.length < activeSession.lastWritten.length &&
-            now > activeSession.allowClearUntil
-        ) {
+        if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
             val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
             DiagnosticLog.add(
-                "WX-LOCK",
-                "IME delete detected currentLen=${current.length} lastLen=${activeSession.lastWritten.length} restoreLen=${restore.length}"
+                "APP-LOCK",
+                "restore-delete pkg=$pkg currentLen=${current.length} lastLen=${activeSession.lastWritten.length} restoreLen=${restore.length}"
             )
-            return writeWeChatIme(
+            return writeIme(pkg, current, restore, "lock-restore-delete-ime", activeSession)
+        }
+
+        val change = if (event == null) null else IncrementalTransformer.Change(
+            beforeText = event.beforeText?.toString(),
+            fromIndex = event.fromIndex,
+            addedCount = event.addedCount,
+            removedCount = event.removedCount,
+        )
+
+        val target = if (settlingComposition) {
+            TextReplacer.replace(current, cachedRules)
+        } else {
+            IncrementalTransformer.transform(
                 current = current,
-                target = restore,
-                reason = "lock-restore-delete-ime",
-                activeSession = activeSession,
+                previousOutput = activeSession.lastWritten,
+                change = change,
+                rules = cachedRules,
+            )
+        }
+
+        val hit = target != current
+        DiagnosticLog.add(
+            "APP-TRANSFORM",
+            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=false settle=$settlingComposition"
+        )
+
+        if (!hit) {
+            activeSession.lastWritten = current
+            if (lockReplacementEnabled && activeSession.lockActive) {
+                activeSession.lockedText = current
+            }
+            return true
+        }
+
+        val ok = writeIme(pkg, current, target, reason, activeSession)
+        if (ok && lockReplacementEnabled) {
+            activeSession.lockActive = true
+            activeSession.lockedText = target
+            DiagnosticLog.add("APP-LOCK", "armed pkg=$pkg len=${target.length}")
+        }
+        return ok
+    }
+
+    private fun writeIme(
+        pkg: String,
+        current: String,
+        target: String,
+        reason: String,
+        activeSession: InputSession,
+    ): Boolean {
+        if (Build.VERSION.SDK_INT < 33) return false
+
+        val result = AccessibilityImeBridge.replaceAll(
+            service = this,
+            expectedPackage = pkg,
+            expectedCurrent = current,
+            target = target,
+            probeSurrounding = false,
+        )
+        DiagnosticLog.add(
+            "APP-IME-WRITE",
+            "pkg=$pkg reason=$reason issued=${result.issued} editor=${result.editorPackage} started=${result.inputStarted} conn=${result.hasConnection} surroundingLen=${result.surroundingLength} match=${result.surroundingMatchesExpected} err=${result.error}"
+        )
+
+        if (!result.issued) {
+            ServiceRuntimeState.markError("InputConnection 写入失败：$pkg · ${result.error}")
+            return false
+        }
+
+        activeSession.lastWritten = target
+        activeSession.lastWriteAt = System.currentTimeMillis()
+        if (activeSession.lockActive) activeSession.lockedText = target
+        ServiceRuntimeState.markReplacement(pkg)
+        ServiceRuntimeState.markNode("InputConnection 写入成功：$pkg（$reason）")
+        return true
+    }
+
+    private fun processNode(
+        node: AccessibilityNodeInfo,
+        event: AccessibilityEvent?,
+        reason: String,
+    ): Boolean {
+        if (!isEditableTarget(node)) return false
+
+        val pkg = node.packageName?.toString().orEmpty()
+        if (pkg.isBlank() || pkg == packageName) return false
+
+        val current = node.text?.toString() ?: ""
+        val key = nodeKey(node)
+        val now = System.currentTimeMillis()
+        val activeSession = nodeSession?.takeIf { it.key == key }
+            ?: InputSession(key).also { nodeSession = it }
+
+        if (
+            now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
+            current == activeSession.lastWritten
+        ) {
+            return true
+        }
+
+        val composing = updateCompositionState(pkg, event, activeSession)
+        if (composing) {
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "defer-transform pkg=$pkg len=${current.length} pending=${activeSession.compositionPending} path=node"
+            )
+            return true
+        }
+
+        val settlingComposition = activeSession.compositionPending
+        if (settlingComposition) {
+            activeSession.compositionPending = false
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "settled pkg=$pkg len=${current.length}; full-pass path=node"
+            )
+        }
+
+        if (current.isEmpty()) {
+            if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
+                val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
+                return writeNodeOrIme(
+                    node,
+                    pkg,
+                    current,
+                    restore,
+                    0,
+                    0,
+                    "lock-restore-empty",
+                    activeSession,
+                )
+            }
+            activeSession.lastWritten = ""
+            activeSession.clearLock()
+            return true
+        }
+
+        if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
+            val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
+            DiagnosticLog.add(
+                "APP-LOCK",
+                "restore-delete-node pkg=$pkg currentLen=${current.length} lastLen=${activeSession.lastWritten.length} restoreLen=${restore.length}"
+            )
+            return writeNodeOrIme(
+                node,
+                pkg,
+                current,
+                restore,
+                node.textSelectionEnd,
+                current.length,
+                "lock-restore-delete",
+                activeSession,
             )
         }
 
@@ -398,20 +502,24 @@ class GlobalReplaceService : AccessibilityService() {
             removedCount = event.removedCount,
         )
 
-        val target = IncrementalTransformer.transform(
-            current = current,
-            previousOutput = activeSession.lastWritten,
-            change = change,
-            rules = cachedRules,
-        )
+        val target = if (settlingComposition) {
+            TextReplacer.replace(current, cachedRules)
+        } else {
+            IncrementalTransformer.transform(
+                current = current,
+                previousOutput = activeSession.lastWritten,
+                change = change,
+                rules = cachedRules,
+            )
+        }
 
-        val replacementOccurred = target != current
+        val hit = target != current
         DiagnosticLog.add(
-            "WX-TRANSFORM",
-            "IME replacement=$replacementOccurred currentLen=${current.length} targetLen=${target.length}"
+            "APP-TRANSFORM",
+            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=false settle=$settlingComposition path=node"
         )
 
-        if (!replacementOccurred) {
+        if (!hit) {
             activeSession.lastWritten = current
             if (lockReplacementEnabled && activeSession.lockActive) {
                 activeSession.lockedText = current
@@ -419,181 +527,181 @@ class GlobalReplaceService : AccessibilityService() {
             return true
         }
 
-        val ok = writeWeChatIme(
-            current = current,
-            target = target,
-            reason = reason,
-            activeSession = activeSession,
+        val ok = writeNodeOrIme(
+            node,
+            pkg,
+            current,
+            target,
+            node.textSelectionEnd,
+            current.length,
+            reason,
+            activeSession,
         )
-
         if (ok && lockReplacementEnabled) {
             activeSession.lockActive = true
             activeSession.lockedText = target
+            DiagnosticLog.add("APP-LOCK", "armed pkg=$pkg len=${target.length} path=node")
         }
         return ok
     }
 
-    private fun writeWeChatIme(
+    private fun updateCompositionState(
+        pkg: String,
+        event: AccessibilityEvent?,
+        activeSession: InputSession,
+    ): Boolean {
+        val now = System.currentTimeMillis()
+        if (event == null) return now < activeSession.compositionUntil
+
+        val added = event.addedCount
+        val removed = event.removedCount
+        val from = event.fromIndex
+        val beforeLen = event.beforeText?.length ?: activeSession.lastWritten.length
+        val alreadyComposing = now < activeSession.compositionUntil
+
+        val replaceInPlace = added > 0 && removed > 0
+        val fullClear =
+            alreadyComposing &&
+                added == 0 &&
+                removed > 0 &&
+                from == 0 &&
+                beforeLen > 0 &&
+                removed >= beforeLen
+        val largeDelete =
+            alreadyComposing &&
+                added == 0 &&
+                removed >= COMPOSING_LARGE_EDIT_MIN &&
+                beforeLen > 0 &&
+                (from == 0 || removed * 3 >= beforeLen)
+
+        if (replaceInPlace || fullClear || largeDelete) {
+            activeSession.compositionUntil = now + COMPOSITION_GRACE_MS
+            activeSession.compositionPending = true
+
+            val composeReason = when {
+                fullClear -> "full-clear"
+                largeDelete -> "large-delete"
+                else -> "replace-in-place"
+            }
+
+            if (activeSession.lockActive) {
+                activeSession.clearLock()
+                DiagnosticLog.add(
+                    "APP-COMPOSE",
+                    "lock-suspended pkg=$pkg reason=$composeReason add=$added remove=$removed from=$from beforeLen=$beforeLen"
+                )
+            } else {
+                DiagnosticLog.add(
+                    "APP-COMPOSE",
+                    "detected pkg=$pkg reason=$composeReason add=$added remove=$removed from=$from beforeLen=$beforeLen"
+                )
+            }
+            return true
+        }
+
+        return now < activeSession.compositionUntil
+    }
+
+    private fun shouldRestoreLockedDeletion(
+        event: AccessibilityEvent?,
+        current: String,
+        activeSession: InputSession,
+        now: Long,
+        composing: Boolean,
+    ): Boolean {
+        if (!lockReplacementEnabled || !activeSession.lockActive) return false
+        if (event == null || composing) return false
+        if (now <= activeSession.allowClearUntil) return false
+        if (event.addedCount != 0 || event.removedCount <= 0) return false
+
+        val beforeLen = event.beforeText?.length ?: activeSession.lastWritten.length
+        if (beforeLen <= 0 || current.length >= beforeLen) return false
+
+        val wholeFieldDelete =
+            event.fromIndex == 0 && event.removedCount >= beforeLen
+        if (wholeFieldDelete) return true
+
+        return event.removedCount <= MAX_MANUAL_LOCK_DELETE_CHARS
+    }
+
+    private fun writeNodeOrIme(
+        node: AccessibilityNodeInfo,
+        pkg: String,
         current: String,
         target: String,
+        oldSelectionEnd: Int,
+        oldLength: Int,
         reason: String,
         activeSession: InputSession,
     ): Boolean {
-        if (Build.VERSION.SDK_INT < 33) return false
+        val focusOk = node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle().apply {
+            putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                target,
+            )
+        }
+        val setTextOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
 
-        val result = WeChatImeBridge.replaceAll(this, current, target)
         DiagnosticLog.add(
-            "WX-IME-WRITE",
-            "reason=$reason issued=${result.issued} editor=${result.editorPackage} started=${result.inputStarted} conn=${result.hasConnection} surroundingLen=${result.surroundingLength} match=${result.surroundingMatchesEvent} sel=${result.selectionStart}..${result.selectionEnd} err=${result.error}"
+            "APP-NODE-WRITE",
+            "pkg=$pkg reason=$reason focus=$focusOk setText=$setTextOk currentLen=${current.length} targetLen=${target.length}"
         )
 
-        if (!result.issued) {
-            ServiceRuntimeState.markError("微信 InputConnection 写入失败：${result.error}")
-            return false
+        if (setTextOk) {
+            restoreSelection(node, target, oldSelectionEnd, oldLength)
+            activeSession.lastWritten = target
+            activeSession.lastWriteAt = System.currentTimeMillis()
+            if (activeSession.lockActive) activeSession.lockedText = target
+            ServiceRuntimeState.markReplacement(pkg)
+            ServiceRuntimeState.markNode("AccessibilityNode 写入成功：$pkg（$reason）")
+            return true
         }
 
-        activeSession.lastWritten = target
-        activeSession.lastWriteAt = System.currentTimeMillis()
-        if (activeSession.lockActive) activeSession.lockedText = target
-        ServiceRuntimeState.markReplacement(WECHAT_PACKAGE)
-        ServiceRuntimeState.markNode("微信 Accessibility InputConnection 已提交写入（$reason）")
-        return true
-    }
-
-    private fun getWeChatImeSession(windowId: Int): InputSession {
-        val key = NodeKey(
-            windowId = windowId,
-            packageName = WECHAT_PACKAGE,
-            viewId = "@accessibility-ime",
-            className = "InputConnection",
-            bounds = "",
-        )
-
-        val current = weChatImeSession
-        if (current != null && current.key.packageName == WECHAT_PACKAGE) {
-            return current
-        }
-
-        return InputSession(key).also { weChatImeSession = it }
-    }
-
-    override fun onInterrupt() {
-        ServiceRuntimeState.markError("系统调用了 onInterrupt")
-        DiagnosticLog.add("SERVICE", "onInterrupt")
-    }
-
-    override fun onUnbind(intent: android.content.Intent?): Boolean {
-        cleanup("无障碍服务已解绑")
-        return super.onUnbind(intent)
-    }
-
-    override fun onDestroy() {
-        cleanup("无障碍服务已销毁")
-        super.onDestroy()
-    }
-
-    private fun cleanup(reason: String) {
-        handler.removeCallbacks(heartbeatRunnable)
-        handler.removeCallbacks(delayedScanRunnable)
-        if (listenerRegistered) {
-            prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
-            listenerRegistered = false
-        }
-        session = null
-        weChatImeSession = null
-        ServiceRuntimeState.markDisconnected(reason)
-        DiagnosticLog.add("SERVICE", reason)
-    }
-
-    private fun reloadRules() {
-        cachedRules = repository.loadRules()
-        DiagnosticLog.add("RULE", "reloaded count=${cachedRules.size}")
-    }
-
-    private fun reloadSettings() {
-        val settings = AppSettings(this)
-        compatibilityScanEnabled = settings.compatibilityScanEnabled
-        lockReplacementEnabled = settings.lockReplacementEnabled
-        DiagnosticLog.add(
-            "SETTINGS",
-            "scan=$compatibilityScanEnabled lock=$lockReplacementEnabled"
-        )
-        if (!lockReplacementEnabled) {
-            session?.clearLock()
-            weChatImeSession?.clearLock()
-        }
-    }
-
-    private fun scheduleFocusedScan(delayMs: Long) {
-        handler.removeCallbacks(delayedScanRunnable)
-        handler.postDelayed(delayedScanRunnable, delayMs)
-    }
-
-    private fun inspectFocusedInput(reason: String) {
-        val activePkg = activeRootPackage()
-        val now = System.currentTimeMillis()
-        val weChatLikelyActive =
-            activePkg == WECHAT_PACKAGE ||
-                (Build.VERSION.SDK_INT >= 33 && now - lastWeChatEventAt <= WECHAT_RECENT_ACTIVITY_MS)
-
-        // WeChat first: the InputConnection is the reliable editor surface on
-        // affected versions. Do not walk the accessibility tree unless IME fails.
-        if (weChatLikelyActive && Build.VERSION.SDK_INT >= 33) {
-            DiagnosticLog.add("WX-SCAN", "IME-first reason=$reason activePkg=${activePkg.orEmpty()}")
-            if (processWeChatImeSnapshot("$reason-ime")) {
-                ServiceRuntimeState.markNode("微信已使用 Accessibility InputConnection（$reason）")
-                return
+        if (Build.VERSION.SDK_INT >= 33) {
+            val imeActive = getImeSession(pkg, node.windowId)
+            val ok = writeIme(
+                pkg,
+                current,
+                target,
+                "$reason-node-fallback",
+                imeActive,
+            )
+            if (ok) {
+                activeSession.lastWritten = target
+                activeSession.lastWriteAt = System.currentTimeMillis()
+                if (activeSession.lockActive) activeSession.lockedText = target
+                return true
             }
-            DiagnosticLog.add("WX-SCAN", "IME unavailable; falling back to node tree")
         }
 
+        ServiceRuntimeState.markError("节点和 InputConnection 均无法写入：$pkg")
+        return false
+    }
+
+    private fun inspectCurrentEditor(reason: String) {
         val node = findFocusedEditable()
         if (node != null) {
             try {
-                val pkg = node.packageName?.toString()
-                if (pkg == packageName) return
-                ServiceRuntimeState.markNode("已找到焦点输入框：${pkg.orEmpty()}（$reason）")
-                if (pkg == WECHAT_PACKAGE) {
-                    DiagnosticLog.add("WX-SCAN", "node path found ${nodeSummary(node)} reason=$reason")
-                }
-                processNode(node, null, reason)
-                return
+                if (processNode(node, null, reason)) return
             } finally {
                 node.recycle()
             }
         }
 
-        if (weChatLikelyActive) {
-            DiagnosticLog.add("WX-SCAN", "no focused editable after IME fallback; ${windowSummary()}")
-            maybeDumpWeChatTree()
-        }
-
-        ServiceRuntimeState.markNode("未找到当前焦点输入框（$reason）")
-    }
-
-    private fun activeRootPackage(): String? {
-        val root = rootInActiveWindow ?: return null
-        return try {
-            root.packageName?.toString()
-        } finally {
-            root.recycle()
-        }
+        if (Build.VERSION.SDK_INT >= 33 && processImeSnapshot(null, "$reason-ime")) return
+        ServiceRuntimeState.markNode("未找到可用输入编辑器（$reason）")
     }
 
     private fun findFocusedEditable(): AccessibilityNodeInfo? {
         val activeRoot = rootInActiveWindow
         if (activeRoot != null) {
             try {
-                val rootPkg = activeRoot.packageName?.toString()
                 val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                 if (focused != null) {
-                    if (rootPkg == WECHAT_PACKAGE) {
-                        DiagnosticLog.add("WX-FOCUS", "root.findFocus -> ${nodeSummary(focused)}")
-                    }
                     if (isEditableTarget(focused)) return focused
                     focused.recycle()
                 }
-
                 findDeepFocusedEditable(activeRoot)?.let { return it }
                 findBestEditableCandidate(activeRoot)?.let { return it }
             } finally {
@@ -611,22 +719,16 @@ class GlobalReplaceService : AccessibilityService() {
             try {
                 val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                 if (focused != null) {
-                    if (root.packageName?.toString() == WECHAT_PACKAGE) {
-                        DiagnosticLog.add(
-                            "WX-FOCUS",
-                            "window(type=${window.type},active=${window.isActive},focused=${window.isFocused}) findFocus -> ${nodeSummary(focused)}"
-                        )
-                    }
                     if (isEditableTarget(focused)) return focused
                     focused.recycle()
                 }
-
                 findDeepFocusedEditable(root)?.let { return it }
                 findBestEditableCandidate(root)?.let { return it }
             } finally {
                 root.recycle()
             }
         }
+
         return null
     }
 
@@ -680,6 +782,7 @@ class GlobalReplaceService : AccessibilityService() {
 
     private fun editableCandidateScore(node: AccessibilityNodeInfo): Int {
         if (node.packageName?.toString() == packageName) return 0
+
         var score = 0
         if (node.isEditable) score += 100
         if (node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) score += 100
@@ -697,131 +800,8 @@ class GlobalReplaceService : AccessibilityService() {
         if (!node.isEnabled || node.isPassword) return false
         if (node.isEditable) return true
         if (node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) return true
-        return node.packageName?.toString() == WECHAT_PACKAGE &&
-            node.className?.toString()?.contains("EditText", ignoreCase = true) == true &&
-            node.isFocusable
-    }
-
-    private fun processNode(
-        node: AccessibilityNodeInfo,
-        event: AccessibilityEvent?,
-        reason: String,
-    ) {
-        if (!isEditableTarget(node)) return
-
-        val current = node.text?.toString() ?: ""
-        val key = nodeKey(node)
-        val now = System.currentTimeMillis()
-        val activeSession = session?.takeIf { it.key == key }
-            ?: InputSession(key).also { session = it }
-        val isWeChat = node.packageName?.toString() == WECHAT_PACKAGE
-
-        if (isWeChat) {
-            DiagnosticLog.add(
-                "WX-PROCESS",
-                "node reason=$reason len=${current.length} selection=${node.textSelectionStart}..${node.textSelectionEnd} lock=${activeSession.lockActive}"
-            )
-        }
-
-        if (
-            now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
-            current == activeSession.lastWritten
-        ) return
-
-        if (current.isEmpty()) {
-            if (
-                lockReplacementEnabled &&
-                activeSession.lockActive &&
-                activeSession.lockedText.isNotEmpty() &&
-                now > activeSession.allowClearUntil
-            ) {
-                writeText(node, activeSession.lockedText, 0, 0, "lock-restore-empty", activeSession)
-            } else {
-                activeSession.lastWritten = ""
-                activeSession.clearLock()
-            }
-            return
-        }
-
-        if (
-            lockReplacementEnabled &&
-            activeSession.lockActive &&
-            activeSession.lastWritten.isNotEmpty() &&
-            current.length < activeSession.lastWritten.length &&
-            now > activeSession.allowClearUntil
-        ) {
-            writeText(
-                node,
-                activeSession.lockedText.ifEmpty { activeSession.lastWritten },
-                node.textSelectionEnd,
-                current.length,
-                "lock-restore-delete",
-                activeSession,
-            )
-            return
-        }
-
-        val target = computeTarget(current, event, activeSession)
-        if (target == current) {
-            activeSession.lastWritten = current
-            if (lockReplacementEnabled && activeSession.lockActive) {
-                activeSession.lockedText = current
-            }
-            return
-        }
-
-        if (writeText(node, target, node.textSelectionEnd, current.length, reason, activeSession)) {
-            if (lockReplacementEnabled) {
-                activeSession.lockActive = true
-                activeSession.lockedText = target
-            }
-        }
-    }
-
-    private fun writeText(
-        node: AccessibilityNodeInfo,
-        text: String,
-        oldSelectionEnd: Int,
-        oldLength: Int,
-        reason: String,
-        activeSession: InputSession,
-    ): Boolean {
-        val isWeChat = node.packageName?.toString() == WECHAT_PACKAGE
-        val ok = setNodeTextCompat(node, text, oldSelectionEnd, oldLength)
-        if (ok) {
-            activeSession.lastWritten = text
-            activeSession.lastWriteAt = System.currentTimeMillis()
-            if (activeSession.lockActive) activeSession.lockedText = text
-            ServiceRuntimeState.markReplacement(node.packageName?.toString())
-            ServiceRuntimeState.markNode("替换写入成功（$reason）")
-            if (isWeChat) DiagnosticLog.add("WX-WRITE", "node success reason=$reason")
-        } else {
-            ServiceRuntimeState.markError(
-                "无法写入目标输入框：${node.packageName?.toString().orEmpty()}"
-            )
-            ServiceRuntimeState.markNode("找到输入框，但写入失败（$reason）")
-            if (isWeChat) DiagnosticLog.add("WX-WRITE", "node FAILED reason=$reason")
-        }
-        return ok
-    }
-
-    private fun computeTarget(
-        current: String,
-        event: AccessibilityEvent?,
-        activeSession: InputSession,
-    ): String {
-        val change = if (event == null) null else IncrementalTransformer.Change(
-            beforeText = event.beforeText?.toString(),
-            fromIndex = event.fromIndex,
-            addedCount = event.addedCount,
-            removedCount = event.removedCount,
-        )
-        return IncrementalTransformer.transform(
-            current = current,
-            previousOutput = activeSession.lastWritten,
-            change = change,
-            rules = cachedRules,
-        )
+        return node.className?.toString()
+            ?.contains("EditText", ignoreCase = true) == true && node.isFocusable
     }
 
     private fun nodeKey(node: AccessibilityNodeInfo): NodeKey {
@@ -836,28 +816,18 @@ class GlobalReplaceService : AccessibilityService() {
         )
     }
 
-    private fun setNodeTextCompat(
-        node: AccessibilityNodeInfo,
-        text: String,
-        oldSelectionEnd: Int,
-        oldLength: Int,
-    ): Boolean {
-        val isWeChat = node.packageName?.toString() == WECHAT_PACKAGE
-        val focusOk = node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        if (isWeChat) DiagnosticLog.add("WX-ACTION", "ACTION_FOCUS=$focusOk")
+    private fun getImeSession(pkg: String, windowId: Int): InputSession {
+        val current = imeSession
+        if (current != null && current.key.packageName == pkg) return current
 
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
-        }
-        val setTextOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        if (isWeChat) DiagnosticLog.add("WX-ACTION", "ACTION_SET_TEXT=$setTextOk")
-        if (setTextOk) {
-            restoreSelection(node, text, oldSelectionEnd, oldLength)
-            return true
-        }
-
-        if (!isWeChat) return false
-        return pasteFallback(node, text)
+        val key = NodeKey(
+            windowId = windowId,
+            packageName = pkg,
+            viewId = "@accessibility-ime",
+            className = "InputConnection",
+            bounds = "",
+        )
+        return InputSession(key).also { imeSession = it }
     }
 
     private fun restoreSelection(
@@ -867,6 +837,7 @@ class GlobalReplaceService : AccessibilityService() {
         oldLength: Int,
     ) {
         if (oldSelectionEnd < 0) return
+
         val delta = text.length - oldLength
         val newSelection = (oldSelectionEnd + delta).coerceIn(0, text.length)
         val args = Bundle().apply {
@@ -876,68 +847,46 @@ class GlobalReplaceService : AccessibilityService() {
         node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
     }
 
-    private fun pasteFallback(node: AccessibilityNodeInfo, text: String): Boolean {
-        val clipboard = getSystemService(ClipboardManager::class.java)
-        val oldClip = clipboard.primaryClip
-        val selectionArgs = Bundle().apply {
-            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
-            putInt(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,
-                node.text?.length ?: 0,
-            )
+    private fun isLikelySendEvent(event: AccessibilityEvent): Boolean {
+        val source = event.source
+        if (source != null) {
+            try {
+                val id = source.viewIdResourceName?.lowercase().orEmpty()
+                val text =
+                    (source.text?.toString() ?: source.contentDescription?.toString())
+                        .orEmpty()
+                        .trim()
+                        .lowercase()
+
+                if (
+                    id.contains("send") ||
+                    id.contains("btn_send") ||
+                    text == "发送" ||
+                    text == "send" ||
+                    text.contains("发送消息")
+                ) {
+                    return true
+                }
+            } finally {
+                source.recycle()
+            }
         }
 
-        val focusOk = node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        val selectOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
-        clipboard.setPrimaryClip(ClipData.newPlainText("typing-replacer", text))
-        val pasteOk = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-        DiagnosticLog.add(
-            "WX-PASTE",
-            "focus=$focusOk selectAll=$selectOk paste=$pasteOk textLen=${node.text?.length ?: 0}"
-        )
-
-        handler.postDelayed({
-            try {
-                if (oldClip != null) {
-                    clipboard.setPrimaryClip(oldClip)
-                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    clipboard.clearPrimaryClip()
-                } else {
-                    clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
-                }
-            } catch (_: Exception) {
-            }
-        }, 180L)
-        return pasteOk
-    }
-
-    private fun isLikelySendButton(node: AccessibilityNodeInfo): Boolean {
-        val id = node.viewIdResourceName?.lowercase().orEmpty()
-        val text = (node.text?.toString() ?: node.contentDescription?.toString()).orEmpty()
-            .trim().lowercase()
-        return id.contains("send") ||
-            id.contains("btn_send") ||
-            text == "发送" ||
-            text == "send" ||
-            text.contains("发送消息")
-    }
-
-    private fun isLikelySendEvent(event: AccessibilityEvent): Boolean {
-        val text = event.text.joinToString(" ").trim().lowercase()
+        val eventText = event.text.joinToString(" ").trim().lowercase()
         val description = event.contentDescription?.toString().orEmpty().trim().lowercase()
-        return text == "发送" ||
-            text.contains("发送消息") ||
+        return eventText == "发送" ||
+            eventText.contains("发送消息") ||
             description == "发送" ||
             description.contains("发送消息")
     }
 
-    private fun logWeChatEvent(event: AccessibilityEvent) {
+    private fun logEvent(pkg: String, event: AccessibilityEvent) {
         val source = event.source
         try {
             DiagnosticLog.add(
-                "WX-EVENT",
+                "APP-EVENT",
                 buildString {
-                    append(eventName(event.eventType))
+                    append("pkg=$pkg type=${eventName(event.eventType)}")
                     append(" win=${event.windowId}")
                     append(" from=${event.fromIndex}")
                     append(" add=${event.addedCount}")
@@ -945,7 +894,6 @@ class GlobalReplaceService : AccessibilityService() {
                     append(" beforeLen=${event.beforeText?.length ?: -1}")
                     append(" eventTextCount=${event.text.size}")
                     append(" eventTextLen=${event.text.firstOrNull()?.length ?: -1}")
-                    append(" contentChange=${event.contentChangeTypes}")
                     append(" source=")
                     append(if (source == null) "null" else nodeSummary(source))
                 }
@@ -955,72 +903,21 @@ class GlobalReplaceService : AccessibilityService() {
         }
     }
 
-    private fun maybeDumpWeChatTree() {
-        val now = System.currentTimeMillis()
-        if (now - lastWeChatTreeDumpAt < TREE_DUMP_INTERVAL_MS) return
-        lastWeChatTreeDumpAt = now
-
-        val root = rootInActiveWindow ?: run {
-            DiagnosticLog.add("WX-TREE", "root=null")
-            return
-        }
-
-        try {
-            var count = 0
-            fun visit(node: AccessibilityNodeInfo, depth: Int) {
-                if (depth > MAX_TREE_DEPTH || count >= MAX_TREE_LOG_NODES) return
-                count++
-                DiagnosticLog.add(
-                    "WX-TREE",
-                    "d=$depth child=${node.childCount} ${nodeSummary(node)}"
-                )
-                for (i in 0 until node.childCount) {
-                    if (count >= MAX_TREE_LOG_NODES) break
-                    val child = node.getChild(i) ?: continue
-                    try {
-                        visit(child, depth + 1)
-                    } finally {
-                        child.recycle()
-                    }
-                }
-            }
-            visit(root, 0)
-            DiagnosticLog.add("WX-TREE", "dump complete nodes=$count")
-        } finally {
-            root.recycle()
-        }
-    }
-
     private fun nodeSummary(node: AccessibilityNodeInfo): String {
-        val actions = node.actionList.joinToString(",") { actionName(it.id) }
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
         return buildString {
-            append("pkg=${node.packageName?.toString().orEmpty()}")
-            append(" class=${node.className?.toString().orEmpty()}")
+            append("class=${node.className?.toString().orEmpty()}")
             append(" id=${node.viewIdResourceName.orEmpty()}")
-            append(" child=${node.childCount}")
-            append(" bounds=${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}")
             append(" editable=${node.isEditable}")
             append(" focusable=${node.isFocusable}")
             append(" focused=${node.isFocused}")
-            append(" a11yFocused=${node.isAccessibilityFocused}")
             append(" enabled=${node.isEnabled}")
             append(" visible=${node.isVisibleToUser}")
             append(" textLen=${node.text?.length ?: -1}")
             append(" sel=${node.textSelectionStart}..${node.textSelectionEnd}")
-            append(" actions=[$actions]")
-        }
-    }
-
-    private fun windowSummary(): String {
-        return windows.joinToString(" | ") { window ->
-            val root = window.root
-            try {
-                "type=${window.type},active=${window.isActive},focused=${window.isFocused},rootPkg=${root?.packageName?.toString().orEmpty()},rootClass=${root?.className?.toString().orEmpty()},child=${root?.childCount ?: -1}"
-            } finally {
-                root?.recycle()
-            }
+            append(" bounds=${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}")
+            append(" actions=${node.actionList.joinToString(",") { it.id.toString() }}")
         }
     }
 
@@ -1035,18 +932,67 @@ class GlobalReplaceService : AccessibilityService() {
         else -> "EVENT_$type"
     }
 
-    private fun actionName(id: Int): String = when (id) {
-        AccessibilityNodeInfo.ACTION_FOCUS -> "FOCUS"
-        AccessibilityNodeInfo.ACTION_CLEAR_FOCUS -> "CLEAR_FOCUS"
-        AccessibilityNodeInfo.ACTION_CLICK -> "CLICK"
-        AccessibilityNodeInfo.ACTION_SET_TEXT -> "SET_TEXT"
-        AccessibilityNodeInfo.ACTION_SET_SELECTION -> "SET_SELECTION"
-        AccessibilityNodeInfo.ACTION_PASTE -> "PASTE"
-        AccessibilityNodeInfo.ACTION_COPY -> "COPY"
-        AccessibilityNodeInfo.ACTION_CUT -> "CUT"
-        AccessibilityNodeInfo.ACTION_LONG_CLICK -> "LONG_CLICK"
-        else -> id.toString()
+    private fun reloadRules() {
+        cachedRules = repository.loadRules()
+        DiagnosticLog.add("RULE", "universal reloaded count=${cachedRules.size}")
     }
+
+    private fun reloadSettings() {
+        val settings = AppSettings(this)
+        compatibilityScanEnabled = settings.compatibilityScanEnabled
+        lockReplacementEnabled = settings.lockReplacementEnabled
+        DiagnosticLog.add(
+            "SETTINGS",
+            "universal scan=$compatibilityScanEnabled lock=$lockReplacementEnabled"
+        )
+
+        if (!lockReplacementEnabled) {
+            nodeSession?.clearLock()
+            imeSession?.clearLock()
+        }
+    }
+
+    private fun scheduleScan(delayMs: Long) {
+        handler.removeCallbacks(delayedScanRunnable)
+        handler.postDelayed(delayedScanRunnable, delayMs)
+    }
+
+    override fun onInterrupt() {
+        ServiceRuntimeState.markError("系统调用了 onInterrupt")
+        DiagnosticLog.add("SERVICE", "universal onInterrupt")
+    }
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        cleanup("无障碍服务已解绑")
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        cleanup("无障碍服务已销毁")
+        super.onDestroy()
+    }
+
+    private fun cleanup(reason: String) {
+        handler.removeCallbacks(heartbeatRunnable)
+        handler.removeCallbacks(delayedScanRunnable)
+
+        if (listenerRegistered) {
+            prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
+            listenerRegistered = false
+        }
+
+        nodeSession = null
+        imeSession = null
+        ServiceRuntimeState.markDisconnected(reason)
+        DiagnosticLog.add("SERVICE", "universal $reason")
+    }
+
+    private data class DerivedText(
+        val text: String,
+        val confident: Boolean,
+        val mode: String,
+        val rawLength: Int,
+    )
 
     private data class NodeKey(
         val windowId: Int,
@@ -1063,6 +1009,8 @@ class GlobalReplaceService : AccessibilityService() {
         var lockActive: Boolean = false,
         var lockedText: String = "",
         var allowClearUntil: Long = 0L,
+        var compositionUntil: Long = 0L,
+        var compositionPending: Boolean = false,
     ) {
         fun clearLock() {
             lockActive = false
@@ -1071,29 +1019,29 @@ class GlobalReplaceService : AccessibilityService() {
 
         fun unlockForSend() {
             allowClearUntil = System.currentTimeMillis() + SEND_CLEAR_GRACE_MS
+            compositionUntil = 0L
+            compositionPending = false
             clearLock()
         }
     }
 
     private companion object {
-        const val TAG = "TypingReplacer"
-        const val WECHAT_PACKAGE = "com.tencent.mm"
+        const val TAG = "TypingReplacerUniversal"
         const val SELF_WRITE_GUARD_MS = 1200L
-        const val COMPATIBILITY_SCAN_INTERVAL_MS = 700L
+        const val COMPATIBILITY_SCAN_INTERVAL_MS = 900L
         const val SEND_CLEAR_GRACE_MS = 1800L
-        const val TREE_DUMP_INTERVAL_MS = 2000L
-        const val MAX_TREE_LOG_NODES = 80
+        const val CONTENT_SCAN_THROTTLE_MS = 400L
+        const val CONTENT_SCAN_DELAY_MS = 120L
+        const val TEXT_FALLBACK_SCAN_DELAY_MS = 70L
+        const val FOCUS_SCAN_DELAY_MS = 80L
+        const val CLICK_SCAN_DELAY_MS = 100L
+        const val WINDOW_SCAN_DELAY_MS = 140L
         const val MAX_TREE_DEPTH = 8
         const val MIN_EDITABLE_CANDIDATE_SCORE = 80
-        const val WECHAT_SYNTHETIC_WINDOW_ID = -1000
+        const val IME_SYNTHETIC_WINDOW_ID = -2000
 
-        const val WECHAT_CONTENT_SCAN_THROTTLE_MS = 450L
-        const val WECHAT_CONTENT_SCAN_DELAY_MS = 120L
-        const val WECHAT_FOCUS_SCAN_DELAY_MS = 80L
-        const val WECHAT_CLICK_SCAN_DELAY_MS = 100L
-        const val WECHAT_FALLBACK_SCAN_DELAY_MS = 80L
-        const val WECHAT_WINDOW_STATE_DEBOUNCE_MS = 600L
-        const val WECHAT_WINDOW_SCAN_DELAY_MS = 140L
-        const val WECHAT_RECENT_ACTIVITY_MS = 2500L
+        const val COMPOSITION_GRACE_MS = 650L
+        const val COMPOSING_LARGE_EDIT_MIN = 8
+        const val MAX_MANUAL_LOCK_DELETE_CHARS = 8
     }
 }
