@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">打字替换</string>
-    <string name="accessibility_service_name">打字替换服务</string>
-    <string name="accessibility_service_description">在当前获得输入焦点的文本框中按规则实时替换文字。服务由 Android 无障碍框架管理。</string>
+    <string name="app_name">TextFlow</string>
+    <string name="accessibility_service_name">TextFlow 文字替换服务</string>
+    <string name="accessibility_service_description">按你的规则在当前输入框中自动替换文字。由 Android 无障碍框架管理，可兼容普通输入与部分语音输入场景。</string>
 </resources>
