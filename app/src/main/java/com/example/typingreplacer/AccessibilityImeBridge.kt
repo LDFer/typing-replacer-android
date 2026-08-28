@@ -542,7 +542,7 @@ object AccessibilityImeBridge {
     )
 
     private const val MAX_SURROUNDING = 8192
-    private const val STABILITY_DELAY_MS = 900L
-    private const val FAST_COMMIT_MIN_QUIET_MS = 900L
-    private const val SETTLE_NUDGE_DELAY_MS = 1120L
+    private const val STABILITY_DELAY_MS = 650L
+    private const val FAST_COMMIT_MIN_QUIET_MS = 500L
+    private const val SETTLE_NUDGE_DELAY_MS = 600L
 }
