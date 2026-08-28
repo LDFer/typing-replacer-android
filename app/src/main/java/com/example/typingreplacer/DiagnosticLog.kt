@@ -6,7 +6,7 @@ import java.util.Locale
 
 /** In-process privacy-preserving trace ring buffer. */
 object DiagnosticLog {
-    private const val MAX_LINES = 360
+    private const val MAX_LINES = 420
     private const val DUPLICATE_WINDOW_MS = 180L
     private val lock = Any()
     private val lines = ArrayDeque<String>()
@@ -70,10 +70,19 @@ object DiagnosticLog {
     }
 
     private fun isImportant(tag: String, message: String): Boolean = when (tag) {
-        "SERVICE", "SESSION", "WX-IME-WRITE", "WX-LOCK", "WX-WRITE", "WX-PASTE", "FLOW" -> true
-        "WX-TRANSFORM" -> message.contains("replacement=true")
-        "WX-IME" -> message.contains("ready=false") ||
-            (message.contains("err=") && !message.endsWith("err="))
+        "SERVICE", "SESSION", "FLOW",
+        "APP-IME-WRITE", "APP-NODE-WRITE", "APP-LOCK",
+        "WX-IME-WRITE", "WX-LOCK", "WX-WRITE", "WX-PASTE" -> true
+
+        "APP-TRANSFORM", "WX-TRANSFORM" -> message.contains("replacement=true")
+
+        "APP-IME", "WX-IME" ->
+            message.contains("ready=false") ||
+                message.contains("surrounding-null") ||
+                message.contains("package-mismatch") ||
+                message.contains("editor-not-ready") ||
+                (message.contains("err=") && !message.endsWith("err="))
+
         else -> false
     }
 }
