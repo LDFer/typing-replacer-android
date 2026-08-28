@@ -1,6 +1,9 @@
 package com.example.typingreplacer
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.SharedPreferences
+import android.graphics.Rect
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -9,236 +12,438 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * 无障碍服务。
+ * V2 architecture:
  *
- * - realtime 模式：输入变化时替换；可开启“锁定替换”，让替换后的文字无法被删除/修改。
- * - send 模式：平时不动输入框，只在点击发送/提交/发布类按钮时替换。
- *
- * 除了监听文本变化事件，还会定时轮询当前输入框，兼容部分手机不发送文本变化事件的情况。
+ * 1. Android's AccessibilityService binding is the primary lifecycle.
+ * 2. TYPE_VIEW_TEXT_CHANGED is the fast path.
+ * 3. The currently focused input node is resolved explicitly; the service never
+ *    blindly edits "the first editable node" on the screen.
+ * 4. A low-frequency focused-node scan is only a compatibility fallback for
+ *    apps/ROMs that stop emitting text-change events after the app goes to the
+ *    background.
+ * 5. Rules are cached in memory and reloaded only when SharedPreferences change.
+ * 6. Self-generated ACTION_SET_TEXT callbacks are suppressed per input session.
  */
 class GlobalReplaceService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
-    private var lastSet = ""
-    private var lastTextEventTime = 0L
-    private var lastRestoreTime = 0L
 
-    private val pollRunnable = object : Runnable {
-        override fun run() {
-            if (AppSettings(this@GlobalReplaceService).mode == AppSettings.MODE_REALTIME) {
-                pollCurrentInput()
+    private lateinit var repository: ReplacementRepository
+    private lateinit var prefs: SharedPreferences
+
+    private var cachedRules: List<ReplacementRule> = emptyList()
+    private var compatibilityScanEnabled = true
+    private var session: InputSession? = null
+    private var listenerRegistered = false
+
+    private val preferenceListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            when (key) {
+                ReplacementRepository.KEY_RULES -> reloadRules()
+                AppSettings.KEY_COMPATIBILITY_SCAN -> reloadSettings()
             }
-            handler.postDelayed(this, POLL_INTERVAL)
         }
+
+    private val delayedScanRunnable = Runnable {
+        inspectFocusedInput(reason = "event-scan")
     }
 
-    private companion object {
-        const val TAG = "TypingReplacer"
-        const val POLL_INTERVAL = 200L
+    private val heartbeatRunnable = object : Runnable {
+        override fun run() {
+            ServiceRuntimeState.markHeartbeat()
+
+            if (compatibilityScanEnabled) {
+                inspectFocusedInput(reason = "compatibility-scan")
+            }
+
+            handler.postDelayed(this, COMPATIBILITY_SCAN_INTERVAL_MS)
+        }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        handler.removeCallbacks(pollRunnable)
-        handler.post(pollRunnable)
+
+        repository = ReplacementRepository(this)
+        prefs = getSharedPreferences(AppSettings.PREFS_NAME, MODE_PRIVATE)
+
+        configureService()
+        reloadRules()
+        reloadSettings()
+
+        if (!listenerRegistered) {
+            prefs.registerOnSharedPreferenceChangeListener(preferenceListener)
+            listenerRegistered = true
+        }
+
+        session = null
+        ServiceRuntimeState.markConnected()
+
+        handler.removeCallbacks(heartbeatRunnable)
+        handler.post(heartbeatRunnable)
+
+        Log.i(TAG, "Accessibility service connected")
+    }
+
+    private fun configureService() {
+        val info = serviceInfo ?: AccessibilityServiceInfo()
+
+        info.eventTypes =
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_FOCUSED or
+                AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_CLICKED or
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                AccessibilityEvent.TYPE_WINDOWS_CHANGED
+
+        info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+        info.notificationTimeout = 0
+        info.flags =
+            info.flags or
+                AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+
+        serviceInfo = info
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        Log.d(TAG, "event type=${event.eventType} pkg=${event.packageName}")
-        if (event.packageName?.toString() == packageName) return
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            lastSet = ""
-            return
-        }
 
-        val mode = AppSettings(this).mode
-        if (mode == AppSettings.MODE_SEND) {
-            handleSendMode(event)
-        } else {
-            handleRealtimeMode(event)
+        val eventPackage = event.packageName?.toString()
+        if (eventPackage == packageName) return
+
+        ServiceRuntimeState.markEvent(eventPackage)
+
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
+                val source = event.source
+                if (source != null) {
+                    try {
+                        if (isEditableTarget(source)) {
+                            processNode(
+                                node = source,
+                                event = event,
+                                reason = "text-event",
+                            )
+                            return
+                        }
+                    } finally {
+                        source.recycle()
+                    }
+                }
+
+                scheduleFocusedScan(40L)
+            }
+
+            AccessibilityEvent.TYPE_VIEW_FOCUSED,
+            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
+                scheduleFocusedScan(40L)
+            }
+
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+                session = null
+                scheduleFocusedScan(100L)
+            }
+
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                // A click often precedes a focus transition. Refresh the target shortly after.
+                scheduleFocusedScan(60L)
+            }
         }
     }
 
     override fun onInterrupt() {
-        // 无障碍服务被系统中断时没有额外清理工作。
-        lastSet = ""
+        ServiceRuntimeState.markError("系统调用了 onInterrupt")
+        Log.w(TAG, "Accessibility service interrupted")
+    }
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        cleanup("无障碍服务已解绑")
+        return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(pollRunnable)
+        cleanup("无障碍服务已销毁")
         super.onDestroy()
     }
 
-    private fun handleSendMode(event: AccessibilityEvent) {
-        if (event.eventType != AccessibilityEvent.TYPE_VIEW_CLICKED) return
-        val clicked = event.source ?: return
-        if (!isLikelySendButton(clicked)) return
+    private fun cleanup(reason: String) {
+        handler.removeCallbacks(heartbeatRunnable)
+        handler.removeCallbacks(delayedScanRunnable)
 
-        val root = rootInActiveWindow ?: return
-        val input = findEditable(root)
-        root.recycle()
-        if (input == null) return
+        if (listenerRegistered) {
+            prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
+            listenerRegistered = false
+        }
+
+        session = null
+        ServiceRuntimeState.markDisconnected(reason)
+    }
+
+    private fun reloadRules() {
+        cachedRules = repository.loadRules()
+        Log.i(TAG, "Rules reloaded: ${cachedRules.size}")
+    }
+
+    private fun reloadSettings() {
+        compatibilityScanEnabled = AppSettings(this).compatibilityScanEnabled
+    }
+
+    private fun scheduleFocusedScan(delayMs: Long) {
+        handler.removeCallbacks(delayedScanRunnable)
+        handler.postDelayed(delayedScanRunnable, delayMs)
+    }
+
+    private fun inspectFocusedInput(reason: String) {
+        val node = findFocusedEditable()
+        if (node == null) {
+            ServiceRuntimeState.markNode("未找到当前焦点输入框（$reason）")
+            return
+        }
 
         try {
-            val original = input.text?.toString() ?: return
-            val rules = ReplacementRepository(this).loadRules()
-            val replaced = TextReplacer.replace(original, rules)
-            if (replaced != original) {
-                setNodeText(input, replaced)
-            }
+            val pkg = node.packageName?.toString()
+            if (pkg == packageName) return
+
+            ServiceRuntimeState.markNode(
+                "已找到焦点输入框：${pkg.orEmpty()}（$reason）"
+            )
+            processNode(node = node, event = null, reason = reason)
         } finally {
-            input.recycle()
+            node.recycle()
         }
     }
 
-    private fun handleRealtimeMode(event: AccessibilityEvent) {
-        if (event.eventType != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) return
-
-        val node = event.source ?: return
-        if (!node.isEditable || node.isPassword) return
-        lastTextEventTime = System.currentTimeMillis()
-
-        val original = node.text?.toString() ?: return
-        Log.d(TAG, "textEvent pkg=${event.packageName} editable=${node.isEditable} text=$original")
-        processRealtimeText(node, original)
-    }
-
-    private fun pollCurrentInput() {
-        // 如果最近有文本变化事件，说明事件驱动已经能工作，轮询只会添乱。
-        if (System.currentTimeMillis() - lastTextEventTime < 500) return
-        val root = rootInActiveWindow ?: return
-        val pkg = root.packageName?.toString()
-        if (pkg == packageName) {
-            root.recycle()
-            return
-        }
-        val input = findEditable(root)
-        root.recycle()
-        if (input == null) return
-
-        try {
-            val original = input.text?.toString() ?: return
-            processRealtimeText(input, original)
-        } finally {
-            input.recycle()
-        }
-    }
-
-    private fun processRealtimeText(node: AccessibilityNodeInfo, original: String) {
-        if (isPlaceholder(node, original)) {
-            lastSet = ""
-            return
-        }
-
-        val settings = AppSettings(this)
-        if (settings.lockReplacement && lastSet.isNotEmpty() && original.isEmpty()) {
-            // 全部删除时，强制恢复上次替换后的内容。
-            restoreLocked(node)
-            return
-        }
-
-        if (original.isEmpty()) {
-            lastSet = ""
-            return
-        }
-
-        val rules = ReplacementRepository(this).loadRules()
-        val replaced = TextReplacer.replace(original, rules)
-        Log.d(TAG, "processed original=$original replaced=$replaced lock=${settings.lockReplacement} lastSet=$lastSet")
-
-        if (settings.lockReplacement && lastSet.isNotEmpty()) {
-            if (original == lastSet) {
-                return
-            }
-            val isAppend = original.startsWith(lastSet)
-            val isDelete = lastSet.startsWith(original)
-            if (isDelete) {
-                // 删除了部分内容，尝试锁回去；如果系统不接受，就放弃锁定避免死循环。
-                val now = System.currentTimeMillis()
-                if (now - lastRestoreTime > 500) {
-                    lastRestoreTime = now
-                    restoreLocked(node)
-                } else {
-                    lastSet = original
+    /**
+     * Prefer FOCUS_INPUT. We never use the old "first editable node in the tree"
+     * strategy because pages can contain search boxes, comments and chat inputs
+     * at the same time.
+     */
+    private fun findFocusedEditable(): AccessibilityNodeInfo? {
+        val activeRoot = rootInActiveWindow
+        if (activeRoot != null) {
+            try {
+                val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                if (focused != null) {
+                    if (isEditableTarget(focused)) {
+                        return focused
+                    }
+                    focused.recycle()
                 }
-                return
-            }
-            if (isAppend) {
-                // 允许在替换结果后面继续输入，并重新锁定新的完整内容。
-                writeLocked(node, replaced)
-                return
-            }
-            // 完全不同的文本：当作新输入处理，避免旧锁定状态卡住新消息。
-            lastSet = ""
-        }
 
-        if (replaced == original) {
-            lastSet = original
-            return
-        }
-
-        writeLocked(node, replaced)
-    }
-
-    private fun isPlaceholder(node: AccessibilityNodeInfo, text: String): Boolean {
-        val hint = node.hintText?.toString().orEmpty()
-        val trimmed = text.trim()
-        return text == hint
-            || trimmed == "发送消息"
-            || trimmed == "输入消息"
-            || trimmed == "说点什么"
-            || trimmed == "你说点什么..."
-            || trimmed.isEmpty()
-    }
-
-    private fun writeLocked(node: AccessibilityNodeInfo, text: String) {
-        val ok = setNodeText(node, text)
-        lastSet = if (ok) text else ""
-    }
-
-    private fun restoreLocked(node: AccessibilityNodeInfo) {
-        if (lastSet.isEmpty()) return
-        val ok = setNodeText(node, lastSet)
-        if (!ok) lastSet = ""
-    }
-
-    private fun isLikelySendButton(node: AccessibilityNodeInfo): Boolean {
-        val id = node.viewIdResourceName?.lowercase().orEmpty()
-        val text = (node.text?.toString() ?: node.contentDescription?.toString()).orEmpty()
-            .trim()
-            .lowercase()
-        return id.contains("send")
-            || id.contains("btn_submit")
-            || text.contains("发送")
-            || text.contains("发布")
-            || text.contains("提交")
-            || text.contains("回复")
-            || text == "send"
-    }
-
-    private fun findEditable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        if (node.isEditable) {
-            return AccessibilityNodeInfo.obtain(node)
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            val found = findEditable(child)
-            child.recycle()
-            if (found != null) {
-                return found
+                val deepFocused = findDeepFocusedEditable(activeRoot)
+                if (deepFocused != null) return deepFocused
+            } finally {
+                activeRoot.recycle()
             }
         }
+
+        val orderedWindows = windows.sortedWith(
+            compareByDescending<android.view.accessibility.AccessibilityWindowInfo> { it.isFocused }
+                .thenByDescending { it.isActive }
+        )
+
+        for (window in orderedWindows) {
+            val root = window.root ?: continue
+            try {
+                val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                if (focused != null) {
+                    if (isEditableTarget(focused)) {
+                        return focused
+                    }
+                    focused.recycle()
+                }
+
+                val deepFocused = findDeepFocusedEditable(root)
+                if (deepFocused != null) return deepFocused
+            } finally {
+                root.recycle()
+            }
+        }
+
         return null
     }
 
-    private fun setNodeText(node: AccessibilityNodeInfo, text: String): Boolean {
-        val arguments = Bundle().apply {
+    private fun findDeepFocusedEditable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (node.isFocused && isEditableTarget(node)) {
+            return AccessibilityNodeInfo.obtain(node)
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            try {
+                val found = findDeepFocusedEditable(child)
+                if (found != null) return found
+            } finally {
+                child.recycle()
+            }
+        }
+
+        return null
+    }
+
+    private fun isEditableTarget(node: AccessibilityNodeInfo): Boolean {
+        if (!node.isEnabled || node.isPassword) return false
+        if (node.isEditable) return true
+
+        return node.actionList.any {
+            it.id == AccessibilityNodeInfo.ACTION_SET_TEXT
+        }
+    }
+
+    private fun processNode(
+        node: AccessibilityNodeInfo,
+        event: AccessibilityEvent?,
+        reason: String,
+    ) {
+        if (!isEditableTarget(node)) return
+
+        val current = node.text?.toString() ?: ""
+        val key = nodeKey(node)
+        val now = System.currentTimeMillis()
+
+        val activeSession =
+            session?.takeIf { it.key == key }
+                ?: InputSession(key = key).also { session = it }
+
+        if (
+            now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
+            current == activeSession.lastWritten
+        ) {
+            return
+        }
+
+        if (current.isEmpty()) {
+            activeSession.lastWritten = ""
+            return
+        }
+
+        val target = computeTarget(
+            current = current,
+            event = event,
+            activeSession = activeSession,
+        )
+
+        if (target == current) {
+            activeSession.lastWritten = current
+            return
+        }
+
+        val selectionEnd = node.textSelectionEnd
+        val ok = setNodeText(node, target, selectionEnd, current.length)
+
+        if (ok) {
+            activeSession.lastWritten = target
+            activeSession.lastWriteAt = now
+            ServiceRuntimeState.markReplacement(node.packageName?.toString())
+            ServiceRuntimeState.markNode("替换写入成功（$reason）")
+            Log.d(TAG, "replace[$reason] '$current' -> '$target'")
+        } else {
+            activeSession.lastWritten = current
+            ServiceRuntimeState.markError(
+                "ACTION_SET_TEXT 被目标应用拒绝：${node.packageName.orEmpty()}"
+            )
+            ServiceRuntimeState.markNode("找到输入框，但 ACTION_SET_TEXT 失败（$reason）")
+            Log.w(TAG, "ACTION_SET_TEXT failed for ${node.packageName}")
+        }
+    }
+
+    private fun computeTarget(
+        current: String,
+        event: AccessibilityEvent?,
+        activeSession: InputSession,
+    ): String {
+        val change =
+            if (event == null) {
+                null
+            } else {
+                IncrementalTransformer.Change(
+                    beforeText = event.beforeText?.toString(),
+                    fromIndex = event.fromIndex,
+                    addedCount = event.addedCount,
+                    removedCount = event.removedCount,
+                )
+            }
+
+        return IncrementalTransformer.transform(
+            current = current,
+            previousOutput = activeSession.lastWritten,
+            change = change,
+            rules = cachedRules,
+        )
+    }
+
+    private fun nodeKey(node: AccessibilityNodeInfo): NodeKey {
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+
+        return NodeKey(
+            windowId = node.windowId,
+            packageName = node.packageName?.toString().orEmpty(),
+            viewId = node.viewIdResourceName.orEmpty(),
+            className = node.className?.toString().orEmpty(),
+            bounds = "${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}",
+        )
+    }
+
+    private fun setNodeText(
+        node: AccessibilityNodeInfo,
+        text: String,
+        oldSelectionEnd: Int,
+        oldLength: Int,
+    ): Boolean {
+        val args = Bundle().apply {
             putCharSequence(
                 AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
                 text,
             )
         }
-        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+
+        val ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        if (!ok) return false
+
+        // ACTION_SET_TEXT often moves the cursor to the end. Restore an approximate
+        // logical position when the app supports ACTION_SET_SELECTION.
+        if (oldSelectionEnd >= 0) {
+            val delta = text.length - oldLength
+            val newSelection = (oldSelectionEnd + delta).coerceIn(0, text.length)
+            val selectionArgs = Bundle().apply {
+                putInt(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT,
+                    newSelection,
+                )
+                putInt(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,
+                    newSelection,
+                )
+            }
+            node.performAction(
+                AccessibilityNodeInfo.ACTION_SET_SELECTION,
+                selectionArgs,
+            )
+        }
+
+        return true
+    }
+
+    private data class NodeKey(
+        val windowId: Int,
+        val packageName: String,
+        val viewId: String,
+        val className: String,
+        val bounds: String,
+    )
+
+    private data class InputSession(
+        val key: NodeKey,
+        var lastWritten: String = "",
+        var lastWriteAt: Long = 0L,
+    )
+
+    private companion object {
+        const val TAG = "TypingReplacer"
+        const val SELF_WRITE_GUARD_MS = 1200L
+        const val COMPATIBILITY_SCAN_INTERVAL_MS = 700L
     }
 }

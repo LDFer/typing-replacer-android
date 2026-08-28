@@ -1,13 +1,12 @@
 package com.example.typingreplacer
 
-import android.Manifest
 import android.app.Activity
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
@@ -16,44 +15,49 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import kotlin.math.max
 
-/**
- * 主界面：编辑替换规则、测试替换、跳转系统无障碍设置。
- */
 class MainActivity : Activity() {
 
     private lateinit var repository: ReplacementRepository
     private lateinit var appSettings: AppSettings
+
     private lateinit var ruleContainer: LinearLayout
     private lateinit var serviceStatus: TextView
-    private lateinit var modeGroup: RadioGroup
+    private lateinit var diagnostics: TextView
+    private lateinit var compatibilityScanCheck: CheckBox
+
+    private val uiHandler = Handler(Looper.getMainLooper())
+
+    private val refreshRunnable = object : Runnable {
+        override fun run() {
+            updateServiceStatus()
+            uiHandler.postDelayed(this, 1000L)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         repository = ReplacementRepository(this)
         appSettings = AppSettings(this)
+
         setContentView(buildContentView())
         renderRules()
-        startKeepAlive()
-    }
-
-    private fun startKeepAlive() {
-        startForegroundService(Intent(this, KeepAliveService::class.java))
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
-        }
     }
 
     override fun onResume() {
         super.onResume()
-        updateServiceStatus()
+        uiHandler.removeCallbacks(refreshRunnable)
+        uiHandler.post(refreshRunnable)
+    }
+
+    override fun onPause() {
+        uiHandler.removeCallbacks(refreshRunnable)
+        super.onPause()
     }
 
     private fun buildContentView(): View {
@@ -65,18 +69,29 @@ class MainActivity : Activity() {
         scroll.addView(root)
 
         root.addView(TextView(this).apply {
-            text = "打字替换（无障碍版）"
-            textSize = 22f
+            text = "打字替换 V2"
+            textSize = 24f
         })
 
         root.addView(TextView(this).apply {
-            text = "开启服务后，可选择“仅发送时替换”或“实时替换”。仅发送时替换平时不会改输入框，不怕删除后自动补全。"
+            text =
+                "V2 不再依赖常驻通知保活。核心服务由 Android 无障碍框架绑定，" +
+                    "优先处理文本变化事件；如果某些应用或 ROM 停止上报事件，" +
+                    "会用低频焦点扫描兜底。"
             textSize = 14f
-            setPadding(0, 8, 0, 8)
+            setPadding(0, 8, 0, 16)
         })
 
-        serviceStatus = TextView(this)
+        serviceStatus = TextView(this).apply {
+            textSize = 16f
+        }
         root.addView(serviceStatus)
+
+        diagnostics = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, 8, 0, 16)
+        }
+        root.addView(diagnostics)
 
         root.addView(Button(this).apply {
             text = "开启 / 管理无障碍服务"
@@ -86,29 +101,29 @@ class MainActivity : Activity() {
         })
 
         root.addView(Button(this).apply {
-            text = "允许不限制电池优化"
+            text = "后台兼容设置（可选）"
             setOnClickListener {
-                val pm = getSystemService(PowerManager::class.java)
-                if (pm.isIgnoringBatteryOptimizations(packageName)) {
-                    Toast.makeText(this@MainActivity, "已经是不限制状态", Toast.LENGTH_SHORT).show()
-                } else {
-                    val intent = Intent(
-                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                        Uri.parse("package:$packageName"),
-                    )
-                    startActivity(intent)
-                }
+                openBatteryCompatibilitySettings()
             }
         })
+
+        compatibilityScanCheck = CheckBox(this).apply {
+            text = "兼容扫描：事件停止时每 0.7 秒检查当前焦点输入框"
+            isChecked = appSettings.compatibilityScanEnabled
+            setOnCheckedChangeListener { _, checked ->
+                appSettings.compatibilityScanEnabled = checked
+            }
+        }
+        root.addView(compatibilityScanCheck)
 
         root.addView(TextView(this).apply {
             text = "测试区"
             textSize = 18f
-            setPadding(0, 32, 0, 8)
+            setPadding(0, 28, 0, 8)
         })
 
         val testInput = EditText(this).apply {
-            hint = "在这里输入：我 今天很开心"
+            hint = "例如输入：我 今天很开心"
             minLines = 2
         }
         root.addView(testInput)
@@ -117,49 +132,22 @@ class MainActivity : Activity() {
             text = "执行替换测试"
             setOnClickListener {
                 val original = testInput.text.toString()
-                val rules = repository.loadRules()
-                testInput.setText(TextReplacer.replace(original, rules))
+                testInput.setText(
+                    TextReplacer.replace(original, repository.loadRules())
+                )
+                testInput.setSelection(testInput.text.length)
             }
         })
 
         root.addView(TextView(this).apply {
-            text = "处理模式"
-            textSize = 18f
-            setPadding(0, 32, 0, 8)
-        })
-
-        val rbSend = RadioButton(this).apply {
-            id = View.generateViewId()
-            text = "仅发送时替换（推荐）"
-        }
-        val rbRealtime = RadioButton(this).apply {
-            id = View.generateViewId()
-            text = "实时替换（输入框会变）"
-        }
-
-        modeGroup = RadioGroup(this).apply {
-            orientation = RadioGroup.VERTICAL
-            addView(rbSend)
-            addView(rbRealtime)
-        }
-
-        if (appSettings.mode == AppSettings.MODE_SEND) {
-            rbSend.isChecked = true
-        } else {
-            rbRealtime.isChecked = true
-        }
-        root.addView(modeGroup)
-
-        val lockCheck = CheckBox(this).apply {
-            text = "锁定替换（替换后不可删除/修改，删除会自动恢复）"
-            isChecked = appSettings.lockReplacement
-        }
-        root.addView(lockCheck)
-
-        root.addView(TextView(this).apply {
             text = "替换规则"
             textSize = 18f
-            setPadding(0, 32, 0, 8)
+            setPadding(0, 28, 0, 8)
+        })
+
+        root.addView(TextView(this).apply {
+            text = "规则采用单次最长匹配，替换结果不会在同一轮再次触发其他规则。"
+            textSize = 13f
         })
 
         ruleContainer = LinearLayout(this).apply {
@@ -175,34 +163,123 @@ class MainActivity : Activity() {
         })
 
         root.addView(Button(this).apply {
-            text = "保存设置"
+            text = "保存规则"
             setOnClickListener {
                 saveRulesFromUi()
-                val selected = if (modeGroup.checkedRadioButtonId == rbSend.id) {
-                    AppSettings.MODE_SEND
-                } else {
-                    AppSettings.MODE_REALTIME
-                }
-                appSettings.mode = selected
-                appSettings.lockReplacement = lockCheck.isChecked
-                Toast.makeText(this@MainActivity, "已保存", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "规则已保存", Toast.LENGTH_SHORT).show()
             }
         })
 
         return scroll
     }
 
-    private fun renderRules() {
-        ruleContainer.removeAllViews()
-        val rules = repository.loadRules()
-        if (rules.isEmpty()) {
-            ruleContainer.addView(TextView(this).apply { text = "暂无规则" })
-        } else {
-            rules.forEach { addRuleRow(it.source, it.replacement, it.enabled) }
+    private fun openBatteryCompatibilitySettings() {
+        val pm = getSystemService(PowerManager::class.java)
+
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName"),
+                )
+            )
+            return
+        }
+
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName"),
+                )
+            )
+        } catch (_: Exception) {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName"),
+                )
+            )
         }
     }
 
-    private fun addRuleRow(source: String, replacement: String, enabled: Boolean) {
+    private fun updateServiceStatus() {
+        val systemEnabled = isReplacementServiceEnabled()
+        val snapshot = ServiceRuntimeState.snapshot()
+        val heartbeatAge = ageMs(snapshot.lastHeartbeatAt)
+
+        when {
+            !systemEnabled -> {
+                serviceStatus.text = "状态：无障碍服务未开启"
+                serviceStatus.setTextColor(Color.RED)
+            }
+
+            snapshot.connected && heartbeatAge in 0..3000L -> {
+                serviceStatus.text = "状态：无障碍服务已连接，后台心跳正常"
+                serviceStatus.setTextColor(Color.rgb(0, 128, 0))
+            }
+
+            else -> {
+                serviceStatus.text =
+                    "状态：系统开关已开启，但服务心跳异常；可能是服务未重新绑定或 ROM 冻结"
+                serviceStatus.setTextColor(Color.rgb(220, 120, 0))
+            }
+        }
+
+        diagnostics.text = buildString {
+            appendLine("服务连接：${if (snapshot.connected) "是" else "否"}")
+            appendLine("最近心跳：${ageText(snapshot.lastHeartbeatAt)}")
+            appendLine(
+                "最近系统事件：${ageText(snapshot.lastEventAt)}" +
+                    packageSuffix(snapshot.lastEventPackage)
+            )
+            appendLine("输入框状态：${snapshot.lastNodeStatus} · ${ageText(snapshot.lastNodeAt)}")
+            appendLine(
+                "最近替换：${ageText(snapshot.lastReplacementAt)}" +
+                    packageSuffix(snapshot.lastReplacementPackage)
+            )
+            if (snapshot.lastError.isNotEmpty()) {
+                append("最近错误：${snapshot.lastError}")
+            }
+        }.trim()
+    }
+
+    private fun packageSuffix(packageName: String): String =
+        if (packageName.isBlank()) "" else " · $packageName"
+
+    private fun ageMs(timestamp: Long): Long =
+        if (timestamp <= 0L) Long.MAX_VALUE
+        else max(0L, System.currentTimeMillis() - timestamp)
+
+    private fun ageText(timestamp: Long): String {
+        if (timestamp <= 0L) return "无"
+
+        val delta = max(0L, System.currentTimeMillis() - timestamp)
+        return when {
+            delta < 1000L -> "${delta}ms 前"
+            delta < 60_000L -> "${delta / 1000L}s 前"
+            else -> "${delta / 60_000L}min 前"
+        }
+    }
+
+    private fun renderRules() {
+        ruleContainer.removeAllViews()
+        val rules = repository.loadRules()
+
+        if (rules.isEmpty()) {
+            ruleContainer.addView(TextView(this).apply { text = "暂无规则" })
+        } else {
+            rules.forEach {
+                addRuleRow(it.source, it.replacement, it.enabled)
+            }
+        }
+    }
+
+    private fun addRuleRow(
+        source: String,
+        replacement: String,
+        enabled: Boolean,
+    ) {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -217,7 +294,12 @@ class MainActivity : Activity() {
         val sourceEdit = EditText(this).apply {
             hint = "原词"
             setText(source)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            layoutParams =
+                LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    1f,
+                )
         }
         row.addView(sourceEdit)
 
@@ -229,7 +311,12 @@ class MainActivity : Activity() {
         val replacementEdit = EditText(this).apply {
             hint = "替换为"
             setText(replacement)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            layoutParams =
+                LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    1f,
+                )
         }
         row.addView(replacementEdit)
 
@@ -245,42 +332,45 @@ class MainActivity : Activity() {
 
     private fun saveRulesFromUi() {
         val rules = mutableListOf<ReplacementRule>()
+
         for (i in 0 until ruleContainer.childCount) {
             val row = ruleContainer.getChildAt(i) as? LinearLayout ?: continue
             if (row.childCount < 5) continue
 
-            val enabled = (row.getChildAt(0) as? CheckBox)?.isChecked ?: true
-            val source = (row.getChildAt(1) as? EditText)?.text?.toString()?.trim().orEmpty()
-            val replacement = (row.getChildAt(3) as? EditText)?.text?.toString()?.trim().orEmpty()
+            val enabled =
+                (row.getChildAt(0) as? CheckBox)?.isChecked ?: true
+            val source =
+                (row.getChildAt(1) as? EditText)?.text?.toString()?.trim().orEmpty()
+            val replacement =
+                (row.getChildAt(3) as? EditText)?.text?.toString()?.trim().orEmpty()
 
             if (source.isNotEmpty()) {
-                rules.add(ReplacementRule(source, replacement, enabled))
+                rules.add(
+                    ReplacementRule(
+                        source = source,
+                        replacement = replacement,
+                        enabled = enabled,
+                    )
+                )
             }
         }
+
         repository.saveRules(rules)
     }
 
-    private fun updateServiceStatus() {
-        val enabled = isReplacementServiceEnabled()
-        serviceStatus.text = if (enabled) {
-            "状态：已开启（正在全局替换）"
-        } else {
-            "状态：未开启，请点击下方按钮去系统设置里开启"
-        }
-        serviceStatus.setTextColor(if (enabled) Color.GREEN else Color.RED)
-    }
-
     private fun isReplacementServiceEnabled(): Boolean {
-        val enabledServices = Settings.Secure.getString(
-            contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-        ) ?: return false
+        val enabledServices =
+            Settings.Secure.getString(
+                contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            ) ?: return false
 
         val fullName = "$packageName/${GlobalReplaceService::class.java.name}"
         val shortName = "$packageName/.GlobalReplaceService"
 
         return enabledServices.split(':').any {
-            it.equals(fullName, ignoreCase = true) || it.equals(shortName, ignoreCase = true)
+            it.equals(fullName, ignoreCase = true) ||
+                it.equals(shortName, ignoreCase = true)
         }
     }
 }
