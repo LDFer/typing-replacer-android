@@ -19,25 +19,30 @@ jobs:
           ref: universal-ime-fallback
           fetch-depth: 0
 
-      - name: Apply adaptive voice settle window
+      - name: Tune IME settle thresholds
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('app/src/main/java/com/example/typingreplacer/GlobalReplaceService.kt')
+          path = Path('app/src/main/java/com/example/typingreplacer/AccessibilityImeBridge.kt')
           text = path.read_text(encoding='utf-8')
-          old = 'const val COMPOSITION_GRACE_MS = 1200L'
-          new = 'const val COMPOSITION_GRACE_MS = 650L'
-          if text.count(old) != 1:
-              raise SystemExit(f'expected exactly one {old!r}, found {text.count(old)}')
-          path.write_text(text.replace(old, new), encoding='utf-8')
+          replacements = {
+              'private const val STABILITY_DELAY_MS = 900L': 'private const val STABILITY_DELAY_MS = 650L',
+              'private const val FAST_COMMIT_MIN_QUIET_MS = 900L': 'private const val FAST_COMMIT_MIN_QUIET_MS = 500L',
+              'private const val SETTLE_NUDGE_DELAY_MS = 1120L': 'private const val SETTLE_NUDGE_DELAY_MS = 600L',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected exactly one {old!r}, found {text.count(old)}')
+              text = text.replace(old, new)
+          path.write_text(text, encoding='utf-8')
           PY
 
-      - name: Commit service patch
+      - name: Commit bridge patch
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add app/src/main/java/com/example/typingreplacer/GlobalReplaceService.kt
-          git commit -m 'Reduce voice composition settle latency'
+          git add app/src/main/java/com/example/typingreplacer/AccessibilityImeBridge.kt
+          git commit -m 'Tune adaptive IME settle thresholds'
           git push origin HEAD:universal-ime-fallback
