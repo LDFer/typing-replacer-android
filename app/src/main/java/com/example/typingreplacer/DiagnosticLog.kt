@@ -71,7 +71,7 @@ object DiagnosticLog {
 
     private fun isImportant(tag: String, message: String): Boolean = when (tag) {
         "SERVICE", "SESSION", "FLOW",
-        "APP-IME-WRITE", "APP-NODE-WRITE", "APP-LOCK",
+        "APP-IME-WRITE", "APP-NODE-WRITE", "APP-LOCK", "APP-COMPOSE",
         "WX-IME-WRITE", "WX-LOCK", "WX-WRITE", "WX-PASTE" -> true
 
         "APP-TRANSFORM", "WX-TRANSFORM" -> message.contains("replacement=true")
