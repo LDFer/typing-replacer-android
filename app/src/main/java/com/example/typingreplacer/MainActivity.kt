@@ -26,16 +26,15 @@ class MainActivity : Activity() {
 
     private lateinit var repository: ReplacementRepository
     private lateinit var appSettings: AppSettings
-
     private lateinit var ruleContainer: LinearLayout
     private lateinit var serviceStatus: TextView
     private lateinit var diagnostics: TextView
+    private lateinit var diagnosticSummaryView: TextView
     private lateinit var diagnosticLogView: TextView
     private lateinit var compatibilityScanCheck: CheckBox
     private lateinit var lockReplacementCheck: CheckBox
 
     private val uiHandler = Handler(Looper.getMainLooper())
-
     private val refreshRunnable = object : Runnable {
         override fun run() {
             updateServiceStatus()
@@ -74,18 +73,14 @@ class MainActivity : Activity() {
             text = "打字替换 V2"
             textSize = 24f
         })
-
         root.addView(TextView(this).apply {
-            text =
-                "核心服务由 Android 无障碍框架绑定。优先处理文本变化事件，" +
-                    "并用焦点扫描兼容后台；微信写入失败时会自动尝试兼容粘贴。"
+            text = "普通 App 使用 AccessibilityNode；Android 13+ 微信优先使用 Accessibility InputConnection。"
             textSize = 14f
             setPadding(0, 8, 0, 16)
         })
 
         serviceStatus = TextView(this).apply { textSize = 16f }
         root.addView(serviceStatus)
-
         diagnostics = TextView(this).apply {
             textSize = 13f
             setPadding(0, 8, 0, 16)
@@ -94,80 +89,81 @@ class MainActivity : Activity() {
 
         root.addView(Button(this).apply {
             text = "开启 / 管理无障碍服务"
-            setOnClickListener {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            }
+            setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         })
-
         root.addView(Button(this).apply {
             text = "后台兼容设置（可选）"
             setOnClickListener { openBatteryCompatibilitySettings() }
         })
 
         compatibilityScanCheck = CheckBox(this).apply {
-            text = "兼容扫描：事件停止时每 0.7 秒检查当前焦点输入框"
+            text = "兼容扫描：事件异常时定期检查当前编辑器"
             isChecked = appSettings.compatibilityScanEnabled
-            setOnCheckedChangeListener { _, checked ->
-                appSettings.compatibilityScanEnabled = checked
-            }
+            setOnCheckedChangeListener { _, checked -> appSettings.compatibilityScanEnabled = checked }
         }
         root.addView(compatibilityScanCheck)
 
         lockReplacementCheck = CheckBox(this).apply {
-            text = "锁定替换：替换后禁止删除，删除会自动补回（发送后会自动解锁）"
+            text = "锁定替换：替换后禁止删除，删除会自动补回（发送后自动解锁）"
             isChecked = appSettings.lockReplacementEnabled
-            setOnCheckedChangeListener { _, checked ->
-                appSettings.lockReplacementEnabled = checked
-            }
+            setOnCheckedChangeListener { _, checked -> appSettings.lockReplacementEnabled = checked }
         }
         root.addView(lockReplacementCheck)
 
         root.addView(TextView(this).apply {
-            text = "微信提示：如果 ACTION_SET_TEXT 被拒绝，V2 会自动全选输入框并走剪贴板粘贴回退。"
-            textSize = 13f
-            setPadding(0, 6, 0, 10)
-        })
-
-        root.addView(TextView(this).apply {
-            text = "微信诊断日志"
+            text = "诊断与优化"
             textSize = 18f
             setPadding(0, 24, 0, 6)
         })
-
         root.addView(TextView(this).apply {
-            text = "日志不保存聊天正文，只记录节点类型、资源 ID、焦点/编辑状态、文本长度和系统动作结果。测试微信后点“复制诊断日志”发给我。"
+            text = "轻量统计始终运行且不记录聊天正文。需要排查时先开始诊断，再正常使用微信/其他 App，最后结束并复制报告。"
             textSize = 12f
-            setPadding(0, 0, 0, 6)
+            setPadding(0, 0, 0, 8)
         })
 
         root.addView(Button(this).apply {
-            text = "复制诊断日志"
+            text = "开始新的诊断会话"
             setOnClickListener {
-                val text = DiagnosticLog.snapshot()
-                val clipboard = getSystemService(ClipboardManager::class.java)
-                clipboard.setPrimaryClip(ClipData.newPlainText("typing-replacer-log", text))
-                Toast.makeText(
-                    this@MainActivity,
-                    if (text.isBlank()) "当前没有日志" else "诊断日志已复制",
-                    Toast.LENGTH_SHORT,
-                ).show()
+                DiagnosticLog.startSession()
+                updateServiceStatus()
+                Toast.makeText(this@MainActivity, "诊断会话已开始，请去实际输入测试", Toast.LENGTH_SHORT).show()
             }
         })
 
         root.addView(Button(this).apply {
-            text = "清空诊断日志"
+            text = "结束并复制完整诊断报告"
+            setOnClickListener {
+                DiagnosticLog.stopSession()
+                copyDiagnosticReport()
+                updateServiceStatus()
+            }
+        })
+
+        root.addView(Button(this).apply {
+            text = "复制当前诊断报告"
+            setOnClickListener { copyDiagnosticReport() }
+        })
+
+        root.addView(Button(this).apply {
+            text = "清空诊断数据"
             setOnClickListener {
                 DiagnosticLog.clear()
-                diagnosticLogView.text = "暂无日志"
-                Toast.makeText(this@MainActivity, "日志已清空", Toast.LENGTH_SHORT).show()
+                updateServiceStatus()
+                Toast.makeText(this@MainActivity, "诊断数据已清空", Toast.LENGTH_SHORT).show()
             }
         })
 
-        diagnosticLogView = TextView(this).apply {
-            text = "暂无日志"
-            textSize = 11f
+        diagnosticSummaryView = TextView(this).apply {
+            textSize = 12f
             setTextIsSelectable(true)
-            setPadding(0, 6, 0, 16)
+            setPadding(0, 8, 0, 8)
+        }
+        root.addView(diagnosticSummaryView)
+
+        diagnosticLogView = TextView(this).apply {
+            textSize = 10f
+            setTextIsSelectable(true)
+            setPadding(0, 4, 0, 16)
         }
         root.addView(diagnosticLogView)
 
@@ -176,13 +172,11 @@ class MainActivity : Activity() {
             textSize = 18f
             setPadding(0, 28, 0, 8)
         })
-
         val testInput = EditText(this).apply {
             hint = "例如输入：我 今天很开心"
             minLines = 2
         }
         root.addView(testInput)
-
         root.addView(Button(this).apply {
             text = "执行替换测试"
             setOnClickListener {
@@ -197,22 +191,16 @@ class MainActivity : Activity() {
             textSize = 18f
             setPadding(0, 28, 0, 8)
         })
-
         root.addView(TextView(this).apply {
             text = "规则采用单次最长匹配，替换结果不会在同一轮再次触发其他规则。"
             textSize = 13f
         })
-
-        ruleContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
+        ruleContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(ruleContainer)
-
         root.addView(Button(this).apply {
             text = "添加规则"
             setOnClickListener { addRuleRow("", "", true) }
         })
-
         root.addView(Button(this).apply {
             text = "保存规则"
             setOnClickListener {
@@ -220,36 +208,34 @@ class MainActivity : Activity() {
                 Toast.makeText(this@MainActivity, "规则已保存", Toast.LENGTH_SHORT).show()
             }
         })
-
         return scroll
+    }
+
+    private fun copyDiagnosticReport() {
+        val rules = repository.loadRules()
+        val report = DiagnosticMetrics.buildReport(
+            context = this,
+            ruleCount = rules.count { it.enabled && it.source.isNotEmpty() },
+            compatibilityScan = appSettings.compatibilityScanEnabled,
+            lockReplacement = appSettings.lockReplacementEnabled,
+            verboseTrace = DiagnosticLog.isVerbose(),
+            trace = DiagnosticLog.snapshot(),
+        )
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText("typing-replacer-diagnostic-report", report))
+        Toast.makeText(this, "完整诊断报告已复制", Toast.LENGTH_SHORT).show()
     }
 
     private fun openBatteryCompatibilitySettings() {
         val pm = getSystemService(PowerManager::class.java)
         if (pm.isIgnoringBatteryOptimizations(packageName)) {
-            startActivity(
-                Intent(
-                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.parse("package:$packageName"),
-                )
-            )
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
             return
         }
-
         try {
-            startActivity(
-                Intent(
-                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    Uri.parse("package:$packageName"),
-                )
-            )
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
         } catch (_: Exception) {
-            startActivity(
-                Intent(
-                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.parse("package:$packageName"),
-                )
-            )
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
         }
     }
 
@@ -257,7 +243,6 @@ class MainActivity : Activity() {
         val systemEnabled = isReplacementServiceEnabled()
         val snapshot = ServiceRuntimeState.snapshot()
         val heartbeatAge = ageMs(snapshot.lastHeartbeatAt)
-
         when {
             !systemEnabled -> {
                 serviceStatus.text = "状态：无障碍服务未开启"
@@ -268,8 +253,7 @@ class MainActivity : Activity() {
                 serviceStatus.setTextColor(Color.rgb(0, 128, 0))
             }
             else -> {
-                serviceStatus.text =
-                    "状态：系统开关已开启，但服务心跳异常；可能是服务未重新绑定或 ROM 冻结"
+                serviceStatus.text = "状态：系统开关已开启，但服务心跳异常"
                 serviceStatus.setTextColor(Color.rgb(220, 120, 0))
             }
         }
@@ -277,29 +261,22 @@ class MainActivity : Activity() {
         diagnostics.text = buildString {
             appendLine("服务连接：${if (snapshot.connected) "是" else "否"}")
             appendLine("最近心跳：${ageText(snapshot.lastHeartbeatAt)}")
-            appendLine(
-                "最近系统事件：${ageText(snapshot.lastEventAt)}" +
-                    packageSuffix(snapshot.lastEventPackage)
-            )
+            appendLine("最近系统事件：${ageText(snapshot.lastEventAt)}${packageSuffix(snapshot.lastEventPackage)}")
             appendLine("输入框状态：${snapshot.lastNodeStatus} · ${ageText(snapshot.lastNodeAt)}")
-            appendLine(
-                "最近替换：${ageText(snapshot.lastReplacementAt)}" +
-                    packageSuffix(snapshot.lastReplacementPackage)
-            )
+            appendLine("最近替换：${ageText(snapshot.lastReplacementAt)}${packageSuffix(snapshot.lastReplacementPackage)}")
             if (snapshot.lastError.isNotEmpty()) append("最近错误：${snapshot.lastError}")
         }.trim()
 
-        val logText = DiagnosticLog.snapshot(80)
-        diagnosticLogView.text = if (logText.isBlank()) "暂无日志" else logText
+        diagnosticSummaryView.text = buildString {
+            appendLine("详细诊断：${if (DiagnosticLog.isVerbose()) "进行中" else "关闭"}")
+            append(DiagnosticMetrics.summary())
+        }
+        val trace = DiagnosticLog.snapshot(40)
+        diagnosticLogView.text = if (trace.isBlank()) "暂无关键 Trace" else trace
     }
 
-    private fun packageSuffix(packageName: String): String =
-        if (packageName.isBlank()) "" else " · $packageName"
-
-    private fun ageMs(timestamp: Long): Long =
-        if (timestamp <= 0L) Long.MAX_VALUE
-        else max(0L, System.currentTimeMillis() - timestamp)
-
+    private fun packageSuffix(packageName: String): String = if (packageName.isBlank()) "" else " · $packageName"
+    private fun ageMs(timestamp: Long): Long = if (timestamp <= 0L) Long.MAX_VALUE else max(0L, System.currentTimeMillis() - timestamp)
     private fun ageText(timestamp: Long): String {
         if (timestamp <= 0L) return "无"
         val delta = max(0L, System.currentTimeMillis() - timestamp)
@@ -313,11 +290,8 @@ class MainActivity : Activity() {
     private fun renderRules() {
         ruleContainer.removeAllViews()
         val rules = repository.loadRules()
-        if (rules.isEmpty()) {
-            ruleContainer.addView(TextView(this).apply { text = "暂无规则" })
-        } else {
-            rules.forEach { addRuleRow(it.source, it.replacement, it.enabled) }
-        }
+        if (rules.isEmpty()) ruleContainer.addView(TextView(this).apply { text = "暂无规则" })
+        else rules.forEach { addRuleRow(it.source, it.replacement, it.enabled) }
     }
 
     private fun addRuleRow(source: String, replacement: String, enabled: Boolean) {
@@ -326,42 +300,25 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, 8, 0, 8)
         }
-
         val check = CheckBox(this).apply { isChecked = enabled }
         row.addView(check)
-
         val sourceEdit = EditText(this).apply {
             hint = "原词"
             setText(source)
-            layoutParams = LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1f,
-            )
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         row.addView(sourceEdit)
-
-        row.addView(TextView(this).apply {
-            text = " → "
-            textSize = 18f
-        })
-
+        row.addView(TextView(this).apply { text = " → "; textSize = 18f })
         val replacementEdit = EditText(this).apply {
             hint = "替换为"
             setText(replacement)
-            layoutParams = LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1f,
-            )
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         row.addView(replacementEdit)
-
         row.addView(Button(this).apply {
             text = "删"
             setOnClickListener { ruleContainer.removeView(row) }
         })
-
         ruleContainer.addView(row)
     }
 
@@ -373,24 +330,17 @@ class MainActivity : Activity() {
             val enabled = (row.getChildAt(0) as? CheckBox)?.isChecked ?: true
             val source = (row.getChildAt(1) as? EditText)?.text?.toString()?.trim().orEmpty()
             val replacement = (row.getChildAt(3) as? EditText)?.text?.toString()?.trim().orEmpty()
-            if (source.isNotEmpty()) {
-                rules.add(ReplacementRule(source, replacement, enabled))
-            }
+            if (source.isNotEmpty()) rules.add(ReplacementRule(source, replacement, enabled))
         }
         repository.saveRules(rules)
     }
 
     private fun isReplacementServiceEnabled(): Boolean {
-        val enabledServices = Settings.Secure.getString(
-            contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-        ) ?: return false
-
+        val enabledServices = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
         val fullName = "$packageName/${GlobalReplaceService::class.java.name}"
         val shortName = "$packageName/.GlobalReplaceService"
         return enabledServices.split(':').any {
-            it.equals(fullName, ignoreCase = true) ||
-                it.equals(shortName, ignoreCase = true)
+            it.equals(fullName, ignoreCase = true) || it.equals(shortName, ignoreCase = true)
         }
     }
 }
