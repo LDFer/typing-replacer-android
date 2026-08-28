@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.typingreplacer"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "2.0.0"
     }
 
     buildTypes {
@@ -37,4 +37,5 @@ android {
 
 dependencies {
     implementation(kotlin("stdlib"))
+    testImplementation("junit:junit:4.13.2")
 }

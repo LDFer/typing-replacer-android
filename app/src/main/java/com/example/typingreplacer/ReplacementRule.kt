@@ -2,9 +2,6 @@ package com.example.typingreplacer
 
 import org.json.JSONObject
 
-/**
- * 一条替换规则：把 [source] 替换为 [replacement]。
- */
 data class ReplacementRule(
     val source: String,
     val replacement: String,

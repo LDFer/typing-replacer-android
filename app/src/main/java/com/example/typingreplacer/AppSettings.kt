@@ -3,29 +3,31 @@ package com.example.typingreplacer
 import android.content.Context
 
 /**
- * 保存处理模式、锁定替换等全局设置。
+ * Runtime options for the V2 accessibility engine.
  */
 class AppSettings(context: Context) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    var mode: String
-        get() = prefs.getString(KEY_MODE, MODE_REALTIME) ?: MODE_REALTIME
+    var compatibilityScanEnabled: Boolean
+        get() = prefs.getBoolean(KEY_COMPATIBILITY_SCAN, true)
         set(value) {
-            prefs.edit().putString(KEY_MODE, value).apply()
+            prefs.edit().putBoolean(KEY_COMPATIBILITY_SCAN, value).apply()
         }
 
-    var lockReplacement: Boolean
-        get() = prefs.getBoolean(KEY_LOCK_REPLACEMENT, true)
+    /**
+     * When enabled, once a real replacement has happened, the resulting text is
+     * treated as locked. User deletions/edits are restored automatically until
+     * the message is sent or the input session changes.
+     */
+    var lockReplacementEnabled: Boolean
+        get() = prefs.getBoolean(KEY_LOCK_REPLACEMENT, false)
         set(value) {
             prefs.edit().putBoolean(KEY_LOCK_REPLACEMENT, value).apply()
         }
 
     companion object {
         const val PREFS_NAME = "typing_replacer_prefs"
-        const val KEY_MODE = "processing_mode"
-        const val KEY_LOCK_REPLACEMENT = "lock_replacement"
-
-        const val MODE_REALTIME = "realtime"
-        const val MODE_SEND = "send"
+        const val KEY_COMPATIBILITY_SCAN = "compatibility_scan"
+        const val KEY_LOCK_REPLACEMENT = "lock_replacement_v2"
     }
 }
