@@ -13,6 +13,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 
 /**
  * V2 accessibility engine.
@@ -72,6 +73,10 @@ class GlobalReplaceService : AccessibilityService() {
 
         session = null
         ServiceRuntimeState.markConnected()
+        DiagnosticLog.add(
+            "SERVICE",
+            "connected rules=${cachedRules.size} scan=$compatibilityScanEnabled lock=$lockReplacementEnabled"
+        )
         handler.removeCallbacks(heartbeatRunnable)
         handler.post(heartbeatRunnable)
         Log.i(TAG, "Accessibility service connected")
@@ -94,6 +99,10 @@ class GlobalReplaceService : AccessibilityService() {
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         serviceInfo = info
+        DiagnosticLog.add(
+            "SERVICE",
+            "configured eventTypes=${info.eventTypes} flags=${info.flags} timeout=${info.notificationTimeout}"
+        )
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -102,18 +111,46 @@ class GlobalReplaceService : AccessibilityService() {
         if (eventPackage == packageName) return
         ServiceRuntimeState.markEvent(eventPackage)
 
+        if (eventPackage == WECHAT_PACKAGE) {
+            val source = event.source
+            try {
+                DiagnosticLog.add(
+                    "WX-EVENT",
+                    buildString {
+                        append(eventName(event.eventType))
+                        append(" win=${event.windowId}")
+                        append(" from=${event.fromIndex}")
+                        append(" add=${event.addedCount}")
+                        append(" remove=${event.removedCount}")
+                        append(" beforeLen=${event.beforeText?.length ?: -1}")
+                        append(" source=")
+                        append(if (source == null) "null" else nodeSummary(source))
+                    }
+                )
+            } finally {
+                source?.recycle()
+            }
+        }
+
         when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
                 val source = event.source
                 if (source != null) {
                     try {
                         if (isEditableTarget(source)) {
+                            if (eventPackage == WECHAT_PACKAGE) {
+                                DiagnosticLog.add("WX-FLOW", "text-event accepted ${nodeSummary(source)}")
+                            }
                             processNode(source, event, "text-event")
                             return
+                        } else if (eventPackage == WECHAT_PACKAGE) {
+                            DiagnosticLog.add("WX-FLOW", "text-event source rejected ${nodeSummary(source)}")
                         }
                     } finally {
                         source.recycle()
                     }
+                } else if (eventPackage == WECHAT_PACKAGE) {
+                    DiagnosticLog.add("WX-FLOW", "text-event has no source; scheduling scan")
                 }
                 scheduleFocusedScan(35L)
             }
@@ -124,6 +161,9 @@ class GlobalReplaceService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
                 session = null
+                if (eventPackage == WECHAT_PACKAGE) {
+                    DiagnosticLog.add("WX-FLOW", "window changed; session cleared")
+                }
                 scheduleFocusedScan(90L)
             }
 
@@ -132,6 +172,7 @@ class GlobalReplaceService : AccessibilityService() {
                 if (clicked != null) {
                     try {
                         if (isLikelySendButton(clicked)) {
+                            DiagnosticLog.add("FLOW", "send-like button clicked pkg=$eventPackage")
                             session?.apply {
                                 allowClearUntil = System.currentTimeMillis() + SEND_CLEAR_GRACE_MS
                                 lockedText = ""
@@ -149,6 +190,7 @@ class GlobalReplaceService : AccessibilityService() {
 
     override fun onInterrupt() {
         ServiceRuntimeState.markError("系统调用了 onInterrupt")
+        DiagnosticLog.add("SERVICE", "onInterrupt")
     }
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
@@ -170,16 +212,22 @@ class GlobalReplaceService : AccessibilityService() {
         }
         session = null
         ServiceRuntimeState.markDisconnected(reason)
+        DiagnosticLog.add("SERVICE", reason)
     }
 
     private fun reloadRules() {
         cachedRules = repository.loadRules()
+        DiagnosticLog.add("RULE", "reloaded count=${cachedRules.size}")
     }
 
     private fun reloadSettings() {
         val settings = AppSettings(this)
         compatibilityScanEnabled = settings.compatibilityScanEnabled
         lockReplacementEnabled = settings.lockReplacementEnabled
+        DiagnosticLog.add(
+            "SETTINGS",
+            "scan=$compatibilityScanEnabled lock=$lockReplacementEnabled"
+        )
         if (!lockReplacementEnabled) {
             session?.apply {
                 lockActive = false
@@ -194,15 +242,36 @@ class GlobalReplaceService : AccessibilityService() {
     }
 
     private fun inspectFocusedInput(reason: String) {
+        val activePkg = rootInActiveWindow?.let { root ->
+            try {
+                root.packageName?.toString()
+            } finally {
+                root.recycle()
+            }
+        }
+
+        if (activePkg == WECHAT_PACKAGE) {
+            DiagnosticLog.add("WX-SCAN", "begin reason=$reason windows=${windows.size}")
+        }
+
         val node = findFocusedEditable()
         if (node == null) {
             ServiceRuntimeState.markNode("未找到当前焦点输入框（$reason）")
+            if (activePkg == WECHAT_PACKAGE) {
+                DiagnosticLog.add(
+                    "WX-SCAN",
+                    "no focused editable; ${windowSummary()}"
+                )
+            }
             return
         }
         try {
             val pkg = node.packageName?.toString()
             if (pkg == packageName) return
             ServiceRuntimeState.markNode("已找到焦点输入框：${pkg.orEmpty()}（$reason）")
+            if (pkg == WECHAT_PACKAGE) {
+                DiagnosticLog.add("WX-SCAN", "found ${nodeSummary(node)} reason=$reason")
+            }
             processNode(node, null, reason)
         } finally {
             node.recycle()
@@ -213,26 +282,44 @@ class GlobalReplaceService : AccessibilityService() {
         val activeRoot = rootInActiveWindow
         if (activeRoot != null) {
             try {
+                val rootPkg = activeRoot.packageName?.toString()
                 val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                 if (focused != null) {
+                    if (rootPkg == WECHAT_PACKAGE) {
+                        DiagnosticLog.add("WX-FOCUS", "root.findFocus -> ${nodeSummary(focused)}")
+                    }
                     if (isEditableTarget(focused)) return focused
                     focused.recycle()
+                } else if (rootPkg == WECHAT_PACKAGE) {
+                    DiagnosticLog.add("WX-FOCUS", "root.findFocus -> null root=${nodeSummary(activeRoot)}")
                 }
-                findDeepFocusedEditable(activeRoot)?.let { return it }
+                findDeepFocusedEditable(activeRoot)?.let {
+                    if (rootPkg == WECHAT_PACKAGE) {
+                        DiagnosticLog.add("WX-FOCUS", "deep focus -> ${nodeSummary(it)}")
+                    }
+                    return it
+                }
             } finally {
                 activeRoot.recycle()
             }
         }
 
         val orderedWindows = windows.sortedWith(
-            compareByDescending<android.view.accessibility.AccessibilityWindowInfo> { it.isFocused }
+            compareByDescending<AccessibilityWindowInfo> { it.isFocused }
                 .thenByDescending { it.isActive }
         )
         for (window in orderedWindows) {
             val root = window.root ?: continue
             try {
+                val rootPkg = root.packageName?.toString()
                 val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                 if (focused != null) {
+                    if (rootPkg == WECHAT_PACKAGE) {
+                        DiagnosticLog.add(
+                            "WX-FOCUS",
+                            "window(type=${window.type},active=${window.isActive},focused=${window.isFocused}) findFocus -> ${nodeSummary(focused)}"
+                        )
+                    }
                     if (isEditableTarget(focused)) return focused
                     focused.recycle()
                 }
@@ -265,8 +352,6 @@ class GlobalReplaceService : AccessibilityService() {
         if (node.isEditable) return true
         if (node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) return true
 
-        // Some WeChat versions expose the chat field as a focusable EditText-like
-        // node without advertising isEditable/ACTION_SET_TEXT consistently.
         return node.packageName?.toString() == WECHAT_PACKAGE &&
             node.className?.toString()?.contains("EditText", ignoreCase = true) == true &&
             node.isFocusable
@@ -284,10 +369,21 @@ class GlobalReplaceService : AccessibilityService() {
         val now = System.currentTimeMillis()
         val activeSession = session?.takeIf { it.key == key }
             ?: InputSession(key).also { session = it }
+        val isWeChat = node.packageName?.toString() == WECHAT_PACKAGE
+
+        if (isWeChat) {
+            DiagnosticLog.add(
+                "WX-PROCESS",
+                "reason=$reason len=${current.length} selection=${node.textSelectionStart}..${node.textSelectionEnd} ruleMatch=${TextReplacer.replace(current, cachedRules) != current} lock=${activeSession.lockActive}"
+            )
+        }
 
         if (now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
             current == activeSession.lastWritten
-        ) return
+        ) {
+            if (isWeChat) DiagnosticLog.add("WX-PROCESS", "self-write guard hit")
+            return
+        }
 
         if (current.isEmpty()) {
             if (
@@ -296,16 +392,17 @@ class GlobalReplaceService : AccessibilityService() {
                 activeSession.lockedText.isNotEmpty() &&
                 now > activeSession.allowClearUntil
             ) {
+                if (isWeChat) DiagnosticLog.add("WX-LOCK", "empty -> restore locked len=${activeSession.lockedText.length}")
                 writeText(node, activeSession.lockedText, 0, 0, "lock-restore-empty", activeSession)
             } else {
                 activeSession.lastWritten = ""
                 activeSession.lockedText = ""
                 activeSession.lockActive = false
+                if (isWeChat) DiagnosticLog.add("WX-PROCESS", "empty accepted / session unlocked")
             }
             return
         }
 
-        // Locked text may be extended by typing, but deletion is immediately restored.
         if (
             lockReplacementEnabled &&
             activeSession.lockActive &&
@@ -313,6 +410,12 @@ class GlobalReplaceService : AccessibilityService() {
             current.length < activeSession.lastWritten.length &&
             now > activeSession.allowClearUntil
         ) {
+            if (isWeChat) {
+                DiagnosticLog.add(
+                    "WX-LOCK",
+                    "delete detected currentLen=${current.length} lastLen=${activeSession.lastWritten.length} lockedLen=${activeSession.lockedText.length}"
+                )
+            }
             writeText(
                 node,
                 activeSession.lockedText.ifEmpty { activeSession.lastWritten },
@@ -326,6 +429,13 @@ class GlobalReplaceService : AccessibilityService() {
 
         val target = computeTarget(current, event, activeSession)
         val replacementOccurred = target != current
+
+        if (isWeChat) {
+            DiagnosticLog.add(
+                "WX-TRANSFORM",
+                "replacement=$replacementOccurred currentLen=${current.length} targetLen=${target.length}"
+            )
+        }
 
         if (!replacementOccurred) {
             activeSession.lastWritten = current
@@ -351,6 +461,14 @@ class GlobalReplaceService : AccessibilityService() {
         reason: String,
         activeSession: InputSession,
     ): Boolean {
+        val isWeChat = node.packageName?.toString() == WECHAT_PACKAGE
+        if (isWeChat) {
+            DiagnosticLog.add(
+                "WX-WRITE",
+                "start reason=$reason oldLen=$oldLength newLen=${text.length} ${nodeSummary(node)}"
+            )
+        }
+
         val ok = setNodeTextCompat(node, text, oldSelectionEnd, oldLength)
         if (ok) {
             activeSession.lastWritten = text
@@ -358,11 +476,13 @@ class GlobalReplaceService : AccessibilityService() {
             if (activeSession.lockActive) activeSession.lockedText = text
             ServiceRuntimeState.markReplacement(node.packageName?.toString())
             ServiceRuntimeState.markNode("替换写入成功（$reason）")
+            if (isWeChat) DiagnosticLog.add("WX-WRITE", "success reason=$reason")
         } else {
             ServiceRuntimeState.markError(
                 "无法写入目标输入框：${node.packageName?.toString().orEmpty()}"
             )
             ServiceRuntimeState.markNode("找到输入框，但写入失败（$reason）")
+            if (isWeChat) DiagnosticLog.add("WX-WRITE", "FAILED reason=$reason")
         }
         return ok
     }
@@ -404,17 +524,22 @@ class GlobalReplaceService : AccessibilityService() {
         oldSelectionEnd: Int,
         oldLength: Int,
     ): Boolean {
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val isWeChat = node.packageName?.toString() == WECHAT_PACKAGE
+        val focusOk = node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        if (isWeChat) DiagnosticLog.add("WX-ACTION", "ACTION_FOCUS=$focusOk")
 
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
-        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+        val setTextOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        if (isWeChat) DiagnosticLog.add("WX-ACTION", "ACTION_SET_TEXT=$setTextOk")
+        if (setTextOk) {
             restoreSelection(node, text, oldSelectionEnd, oldLength)
             return true
         }
 
-        if (node.packageName?.toString() != WECHAT_PACKAGE) return false
+        if (!isWeChat) return false
+        DiagnosticLog.add("WX-ACTION", "falling back to clipboard paste")
         return pasteFallback(node, text)
     }
 
@@ -431,7 +556,10 @@ class GlobalReplaceService : AccessibilityService() {
             putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newSelection)
             putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newSelection)
         }
-        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
+        val ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
+        if (node.packageName?.toString() == WECHAT_PACKAGE) {
+            DiagnosticLog.add("WX-ACTION", "ACTION_SET_SELECTION=$ok pos=$newSelection")
+        }
     }
 
     private fun pasteFallback(node: AccessibilityNodeInfo, text: String): Boolean {
@@ -445,10 +573,13 @@ class GlobalReplaceService : AccessibilityService() {
                 (node.text?.length ?: 0),
             )
         }
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
+        val focusOk = node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val selectOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
+        DiagnosticLog.add("WX-PASTE", "focus=$focusOk selectAll=$selectOk textLen=${node.text?.length ?: 0}")
+
         clipboard.setPrimaryClip(ClipData.newPlainText("typing-replacer", text))
-        val ok = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        val pasteOk = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        DiagnosticLog.add("WX-PASTE", "ACTION_PASTE=$pasteOk")
 
         handler.postDelayed({
             try {
@@ -459,12 +590,14 @@ class GlobalReplaceService : AccessibilityService() {
                 } else {
                     clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
                 }
-            } catch (_: Exception) {
+                DiagnosticLog.add("WX-PASTE", "clipboard restored")
+            } catch (e: Exception) {
+                DiagnosticLog.add("WX-PASTE", "clipboard restore error=${e.javaClass.simpleName}")
             }
         }, 180L)
 
-        if (ok) ServiceRuntimeState.markNode("微信兼容粘贴写入成功")
-        return ok
+        if (pasteOk) ServiceRuntimeState.markNode("微信兼容粘贴写入成功")
+        return pasteOk
     }
 
     private fun isLikelySendButton(node: AccessibilityNodeInfo): Boolean {
@@ -476,6 +609,57 @@ class GlobalReplaceService : AccessibilityService() {
             text == "发送" ||
             text == "send" ||
             text.contains("发送消息")
+    }
+
+    private fun nodeSummary(node: AccessibilityNodeInfo): String {
+        val actions = node.actionList.joinToString(",") { actionName(it.id) }
+        return buildString {
+            append("pkg=${node.packageName?.toString().orEmpty()}")
+            append(" class=${node.className?.toString().orEmpty()}")
+            append(" id=${node.viewIdResourceName.orEmpty()}")
+            append(" editable=${node.isEditable}")
+            append(" focusable=${node.isFocusable}")
+            append(" focused=${node.isFocused}")
+            append(" a11yFocused=${node.isAccessibilityFocused}")
+            append(" enabled=${node.isEnabled}")
+            append(" visible=${node.isVisibleToUser}")
+            append(" textLen=${node.text?.length ?: -1}")
+            append(" actions=[$actions]")
+        }
+    }
+
+    private fun windowSummary(): String {
+        return windows.joinToString(" | ") { window ->
+            val root = window.root
+            try {
+                "type=${window.type},active=${window.isActive},focused=${window.isFocused},rootPkg=${root?.packageName?.toString().orEmpty()},rootClass=${root?.className?.toString().orEmpty()}"
+            } finally {
+                root?.recycle()
+            }
+        }
+    }
+
+    private fun eventName(type: Int): String = when (type) {
+        AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> "TEXT_CHANGED"
+        AccessibilityEvent.TYPE_VIEW_FOCUSED -> "VIEW_FOCUSED"
+        AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> "SELECTION_CHANGED"
+        AccessibilityEvent.TYPE_VIEW_CLICKED -> "VIEW_CLICKED"
+        AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> "WINDOW_STATE_CHANGED"
+        AccessibilityEvent.TYPE_WINDOWS_CHANGED -> "WINDOWS_CHANGED"
+        else -> "EVENT_$type"
+    }
+
+    private fun actionName(id: Int): String = when (id) {
+        AccessibilityNodeInfo.ACTION_FOCUS -> "FOCUS"
+        AccessibilityNodeInfo.ACTION_CLEAR_FOCUS -> "CLEAR_FOCUS"
+        AccessibilityNodeInfo.ACTION_CLICK -> "CLICK"
+        AccessibilityNodeInfo.ACTION_SET_TEXT -> "SET_TEXT"
+        AccessibilityNodeInfo.ACTION_SET_SELECTION -> "SET_SELECTION"
+        AccessibilityNodeInfo.ACTION_PASTE -> "PASTE"
+        AccessibilityNodeInfo.ACTION_COPY -> "COPY"
+        AccessibilityNodeInfo.ACTION_CUT -> "CUT"
+        AccessibilityNodeInfo.ACTION_LONG_CLICK -> "LONG_CLICK"
+        else -> id.toString()
     }
 
     private data class NodeKey(
