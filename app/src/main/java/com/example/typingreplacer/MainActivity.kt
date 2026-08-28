@@ -29,6 +29,7 @@ class MainActivity : Activity() {
     private lateinit var serviceStatus: TextView
     private lateinit var diagnostics: TextView
     private lateinit var compatibilityScanCheck: CheckBox
+    private lateinit var lockReplacementCheck: CheckBox
 
     private val uiHandler = Handler(Looper.getMainLooper())
 
@@ -41,10 +42,8 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         repository = ReplacementRepository(this)
         appSettings = AppSettings(this)
-
         setContentView(buildContentView())
         renderRules()
     }
@@ -75,16 +74,13 @@ class MainActivity : Activity() {
 
         root.addView(TextView(this).apply {
             text =
-                "V2 不再依赖常驻通知保活。核心服务由 Android 无障碍框架绑定，" +
-                    "优先处理文本变化事件；如果某些应用或 ROM 停止上报事件，" +
-                    "会用低频焦点扫描兜底。"
+                "核心服务由 Android 无障碍框架绑定。优先处理文本变化事件，" +
+                    "并用焦点扫描兼容后台；微信写入失败时会自动尝试兼容粘贴。"
             textSize = 14f
             setPadding(0, 8, 0, 16)
         })
 
-        serviceStatus = TextView(this).apply {
-            textSize = 16f
-        }
+        serviceStatus = TextView(this).apply { textSize = 16f }
         root.addView(serviceStatus)
 
         diagnostics = TextView(this).apply {
@@ -102,9 +98,7 @@ class MainActivity : Activity() {
 
         root.addView(Button(this).apply {
             text = "后台兼容设置（可选）"
-            setOnClickListener {
-                openBatteryCompatibilitySettings()
-            }
+            setOnClickListener { openBatteryCompatibilitySettings() }
         })
 
         compatibilityScanCheck = CheckBox(this).apply {
@@ -115,6 +109,21 @@ class MainActivity : Activity() {
             }
         }
         root.addView(compatibilityScanCheck)
+
+        lockReplacementCheck = CheckBox(this).apply {
+            text = "锁定替换：替换后禁止删除，删除会自动补回（发送后会自动解锁）"
+            isChecked = appSettings.lockReplacementEnabled
+            setOnCheckedChangeListener { _, checked ->
+                appSettings.lockReplacementEnabled = checked
+            }
+        }
+        root.addView(lockReplacementCheck)
+
+        root.addView(TextView(this).apply {
+            text = "微信提示：如果 ACTION_SET_TEXT 被拒绝，V2 会自动全选输入框并走剪贴板粘贴回退。"
+            textSize = 13f
+            setPadding(0, 6, 0, 10)
+        })
 
         root.addView(TextView(this).apply {
             text = "测试区"
@@ -132,9 +141,7 @@ class MainActivity : Activity() {
             text = "执行替换测试"
             setOnClickListener {
                 val original = testInput.text.toString()
-                testInput.setText(
-                    TextReplacer.replace(original, repository.loadRules())
-                )
+                testInput.setText(TextReplacer.replace(original, repository.loadRules()))
                 testInput.setSelection(testInput.text.length)
             }
         })
@@ -157,9 +164,7 @@ class MainActivity : Activity() {
 
         root.addView(Button(this).apply {
             text = "添加规则"
-            setOnClickListener {
-                addRuleRow("", "", true)
-            }
+            setOnClickListener { addRuleRow("", "", true) }
         })
 
         root.addView(Button(this).apply {
@@ -175,7 +180,6 @@ class MainActivity : Activity() {
 
     private fun openBatteryCompatibilitySettings() {
         val pm = getSystemService(PowerManager::class.java)
-
         if (pm.isIgnoringBatteryOptimizations(packageName)) {
             startActivity(
                 Intent(
@@ -213,12 +217,10 @@ class MainActivity : Activity() {
                 serviceStatus.text = "状态：无障碍服务未开启"
                 serviceStatus.setTextColor(Color.RED)
             }
-
             snapshot.connected && heartbeatAge in 0..3000L -> {
                 serviceStatus.text = "状态：无障碍服务已连接，后台心跳正常"
                 serviceStatus.setTextColor(Color.rgb(0, 128, 0))
             }
-
             else -> {
                 serviceStatus.text =
                     "状态：系统开关已开启，但服务心跳异常；可能是服务未重新绑定或 ROM 冻结"
@@ -238,9 +240,7 @@ class MainActivity : Activity() {
                 "最近替换：${ageText(snapshot.lastReplacementAt)}" +
                     packageSuffix(snapshot.lastReplacementPackage)
             )
-            if (snapshot.lastError.isNotEmpty()) {
-                append("最近错误：${snapshot.lastError}")
-            }
+            if (snapshot.lastError.isNotEmpty()) append("最近错误：${snapshot.lastError}")
         }.trim()
     }
 
@@ -253,7 +253,6 @@ class MainActivity : Activity() {
 
     private fun ageText(timestamp: Long): String {
         if (timestamp <= 0L) return "无"
-
         val delta = max(0L, System.currentTimeMillis() - timestamp)
         return when {
             delta < 1000L -> "${delta}ms 前"
@@ -265,41 +264,31 @@ class MainActivity : Activity() {
     private fun renderRules() {
         ruleContainer.removeAllViews()
         val rules = repository.loadRules()
-
         if (rules.isEmpty()) {
             ruleContainer.addView(TextView(this).apply { text = "暂无规则" })
         } else {
-            rules.forEach {
-                addRuleRow(it.source, it.replacement, it.enabled)
-            }
+            rules.forEach { addRuleRow(it.source, it.replacement, it.enabled) }
         }
     }
 
-    private fun addRuleRow(
-        source: String,
-        replacement: String,
-        enabled: Boolean,
-    ) {
+    private fun addRuleRow(source: String, replacement: String, enabled: Boolean) {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, 8, 0, 8)
         }
 
-        val check = CheckBox(this).apply {
-            isChecked = enabled
-        }
+        val check = CheckBox(this).apply { isChecked = enabled }
         row.addView(check)
 
         val sourceEdit = EditText(this).apply {
             hint = "原词"
             setText(source)
-            layoutParams =
-                LinearLayout.LayoutParams(
-                    0,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    1f,
-                )
+            layoutParams = LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f,
+            )
         }
         row.addView(sourceEdit)
 
@@ -311,20 +300,17 @@ class MainActivity : Activity() {
         val replacementEdit = EditText(this).apply {
             hint = "替换为"
             setText(replacement)
-            layoutParams =
-                LinearLayout.LayoutParams(
-                    0,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    1f,
-                )
+            layoutParams = LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f,
+            )
         }
         row.addView(replacementEdit)
 
         row.addView(Button(this).apply {
             text = "删"
-            setOnClickListener {
-                ruleContainer.removeView(row)
-            }
+            setOnClickListener { ruleContainer.removeView(row) }
         })
 
         ruleContainer.addView(row)
@@ -332,42 +318,27 @@ class MainActivity : Activity() {
 
     private fun saveRulesFromUi() {
         val rules = mutableListOf<ReplacementRule>()
-
         for (i in 0 until ruleContainer.childCount) {
             val row = ruleContainer.getChildAt(i) as? LinearLayout ?: continue
             if (row.childCount < 5) continue
-
-            val enabled =
-                (row.getChildAt(0) as? CheckBox)?.isChecked ?: true
-            val source =
-                (row.getChildAt(1) as? EditText)?.text?.toString()?.trim().orEmpty()
-            val replacement =
-                (row.getChildAt(3) as? EditText)?.text?.toString()?.trim().orEmpty()
-
+            val enabled = (row.getChildAt(0) as? CheckBox)?.isChecked ?: true
+            val source = (row.getChildAt(1) as? EditText)?.text?.toString()?.trim().orEmpty()
+            val replacement = (row.getChildAt(3) as? EditText)?.text?.toString()?.trim().orEmpty()
             if (source.isNotEmpty()) {
-                rules.add(
-                    ReplacementRule(
-                        source = source,
-                        replacement = replacement,
-                        enabled = enabled,
-                    )
-                )
+                rules.add(ReplacementRule(source, replacement, enabled))
             }
         }
-
         repository.saveRules(rules)
     }
 
     private fun isReplacementServiceEnabled(): Boolean {
-        val enabledServices =
-            Settings.Secure.getString(
-                contentResolver,
-                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-            ) ?: return false
+        val enabledServices = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+        ) ?: return false
 
         val fullName = "$packageName/${GlobalReplaceService::class.java.name}"
         val shortName = "$packageName/.GlobalReplaceService"
-
         return enabledServices.split(':').any {
             it.equals(fullName, ignoreCase = true) ||
                 it.equals(shortName, ignoreCase = true)
