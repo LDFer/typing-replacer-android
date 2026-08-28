@@ -2,10 +2,17 @@ package com.example.typingreplacer
 
 import android.accessibilityservice.AccessibilityService
 import android.annotation.TargetApi
+import android.os.SystemClock
 
 /** Android 13+ generic editor bridge for accessibility services. */
 @TargetApi(33)
 object AccessibilityImeBridge {
+    private val writeGuard = Any()
+    private var lastIssuedPackage = ""
+    private var lastIssuedTargetHash = 0
+    private var lastIssuedTargetLength = -1
+    private var lastIssuedAtElapsed = 0L
+
     data class Snapshot(
         val ready: Boolean,
         val editorPackage: String,
@@ -169,10 +176,42 @@ object AccessibilityImeBridge {
             val selectionStart = surrounding?.let { it.offset + it.selectionStart } ?: -1
             val selectionEnd = surrounding?.let { it.offset + it.selectionEnd } ?: -1
 
+            // A window/content scan and the real TEXT_CHANGED callback can race by
+            // a few milliseconds and request the exact same full-field write. The
+            // second commit can disturb composing state/cursor position, so suppress
+            // only identical package+target writes inside a very small window.
+            val now = SystemClock.elapsedRealtime()
+            val targetHash = target.hashCode()
+            val duplicate = synchronized(writeGuard) {
+                editorPackage == lastIssuedPackage &&
+                    target.length == lastIssuedTargetLength &&
+                    targetHash == lastIssuedTargetHash &&
+                    now - lastIssuedAtElapsed in 0..WRITE_DEDUPE_WINDOW_MS
+            }
+            if (duplicate) {
+                return Result(
+                    issued = true,
+                    editorPackage = editorPackage,
+                    inputStarted = started,
+                    hasConnection = true,
+                    surroundingLength = surroundingText?.length ?: -1,
+                    surroundingMatchesExpected = surroundingText == expectedCurrent,
+                    selectionStart = selectionStart,
+                    selectionEnd = selectionEnd,
+                )
+            }
+
             // Event/node paths pass complete editor text. Selection + commitText works
             // even on devices where getSurroundingText() returns null.
             connection.setSelection(0, expectedCurrent.length)
             connection.commitText(target, 1, null)
+
+            synchronized(writeGuard) {
+                lastIssuedPackage = editorPackage
+                lastIssuedTargetLength = target.length
+                lastIssuedTargetHash = targetHash
+                lastIssuedAtElapsed = now
+            }
 
             Result(
                 issued = true,
@@ -200,4 +239,5 @@ object AccessibilityImeBridge {
     }
 
     private const val MAX_SURROUNDING = 8192
+    private const val WRITE_DEDUPE_WINDOW_MS = 100L
 }
