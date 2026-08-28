@@ -19,7 +19,7 @@
         </activity>
 
         <service
-            android:name=".GlobalReplaceService"
+            android:name=".UniversalReplaceService"
             android:exported="true"
             android:label="@string/accessibility_service_name"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
