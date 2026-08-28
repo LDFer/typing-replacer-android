@@ -19,10 +19,9 @@ import android.view.accessibility.AccessibilityWindowInfo
  * Fast path: editable AccessibilityNodeInfo.
  * Android 13+ fallback: current accessibility InputConnection for any app.
  *
- * Lock mode deliberately distinguishes a simple user deletion from IME composing
- * rewrites. Speech recognition and predictive keyboards repeatedly replace/clear
- * provisional text; treating those mutations as deletion causes restore loops and
- * exponential text duplication.
+ * IME composing/voice revisions are observed but not rewritten in real time.
+ * Once the editor is stable, one full replacement pass runs and lock mode is
+ * re-armed on the resulting text.
  */
 class GlobalReplaceService : AccessibilityService() {
 
@@ -66,10 +65,12 @@ class GlobalReplaceService : AccessibilityService() {
         configureService()
         reloadRules()
         reloadSettings()
+
         if (!listenerRegistered) {
             prefs.registerOnSharedPreferenceChangeListener(preferenceListener)
             listenerRegistered = true
         }
+
         nodeSession = null
         imeSession = null
         ServiceRuntimeState.markConnected()
@@ -77,6 +78,7 @@ class GlobalReplaceService : AccessibilityService() {
             "SERVICE",
             "universal connected rules=${cachedRules.size} scan=$compatibilityScanEnabled lock=$lockReplacementEnabled sdk=${Build.VERSION.SDK_INT}"
         )
+
         handler.removeCallbacks(heartbeatRunnable)
         handler.post(heartbeatRunnable)
         Log.i(TAG, "Universal accessibility service connected")
@@ -105,6 +107,7 @@ class GlobalReplaceService : AccessibilityService() {
         }
         info.flags = flags
         serviceInfo = info
+
         DiagnosticLog.add(
             "SERVICE",
             "universal configured eventTypes=${info.eventTypes} flags=${info.flags} imeFlag=${Build.VERSION.SDK_INT >= 33}"
@@ -128,7 +131,7 @@ class GlobalReplaceService : AccessibilityService() {
             AccessibilityEvent.TYPE_VIEW_FOCUSED -> scheduleScan(FOCUS_SCAN_DELAY_MS)
 
             AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
-                // Selection updates are noisy after commitText and during speech composing.
+                // No scan: selection churn is especially noisy during composing.
             }
 
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
@@ -170,7 +173,8 @@ class GlobalReplaceService : AccessibilityService() {
             }
         }
 
-        return Build.VERSION.SDK_INT >= 33 && processImeEvent(pkg, event, "text-event-ime")
+        return Build.VERSION.SDK_INT >= 33 &&
+            processImeEvent(pkg, event, "text-event-ime")
     }
 
     private fun processImeEvent(
@@ -180,8 +184,11 @@ class GlobalReplaceService : AccessibilityService() {
     ): Boolean {
         if (Build.VERSION.SDK_INT < 33) return false
 
+        val activeSession = getImeSession(pkg, event.windowId)
         val derived = deriveCurrentText(event)
+
         if (derived == null) {
+            updateCompositionState(pkg, event, activeSession)
             DiagnosticLog.add(
                 "APP-IME",
                 "event-text-unavailable pkg=$pkg beforeLen=${event.beforeText?.length ?: -1}"
@@ -190,6 +197,7 @@ class GlobalReplaceService : AccessibilityService() {
         }
 
         if (!derived.confident) {
+            updateCompositionState(pkg, event, activeSession)
             val snapshot = AccessibilityImeBridge.snapshot(this, pkg)
             DiagnosticLog.add(
                 "APP-IME",
@@ -201,7 +209,7 @@ class GlobalReplaceService : AccessibilityService() {
                     current = snapshot.text,
                     event = null,
                     reason = "$reason-snapshot-confirmed",
-                    activeSession = getImeSession(pkg, event.windowId),
+                    activeSession = activeSession,
                 )
             }
             return false
@@ -216,7 +224,7 @@ class GlobalReplaceService : AccessibilityService() {
             current = derived.text,
             event = event,
             reason = reason,
-            activeSession = getImeSession(pkg, event.windowId),
+            activeSession = activeSession,
         )
     }
 
@@ -256,6 +264,7 @@ class GlobalReplaceService : AccessibilityService() {
 
     private fun processImeSnapshot(pkg: String?, reason: String): Boolean {
         if (Build.VERSION.SDK_INT < 33) return false
+
         val snapshot = AccessibilityImeBridge.snapshot(this, pkg)
         DiagnosticLog.add(
             "APP-IME",
@@ -281,6 +290,7 @@ class GlobalReplaceService : AccessibilityService() {
         activeSession: InputSession,
     ): Boolean {
         val now = System.currentTimeMillis()
+
         if (
             now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
             current == activeSession.lastWritten
@@ -291,8 +301,25 @@ class GlobalReplaceService : AccessibilityService() {
 
         val composing = updateCompositionState(pkg, event, activeSession)
 
+        if (composing) {
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "defer-transform pkg=$pkg len=${current.length} pending=${activeSession.compositionPending}"
+            )
+            return true
+        }
+
+        val settlingComposition = activeSession.compositionPending
+        if (settlingComposition) {
+            activeSession.compositionPending = false
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "settled pkg=$pkg len=${current.length}; full-pass"
+            )
+        }
+
         if (current.isEmpty()) {
-            if (shouldRestoreLockedDeletion(event, current, activeSession, now, composing)) {
+            if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
                 val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
                 DiagnosticLog.add(
                     "APP-LOCK",
@@ -303,13 +330,10 @@ class GlobalReplaceService : AccessibilityService() {
 
             activeSession.lastWritten = ""
             activeSession.clearLock()
-            if (composing) {
-                DiagnosticLog.add("APP-COMPOSE", "empty accepted pkg=$pkg; lock cleared during composing")
-            }
             return true
         }
 
-        if (shouldRestoreLockedDeletion(event, current, activeSession, now, composing)) {
+        if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
             val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
             DiagnosticLog.add(
                 "APP-LOCK",
@@ -324,30 +348,37 @@ class GlobalReplaceService : AccessibilityService() {
             addedCount = event.addedCount,
             removedCount = event.removedCount,
         )
-        val target = IncrementalTransformer.transform(
-            current = current,
-            previousOutput = activeSession.lastWritten,
-            change = change,
-            rules = cachedRules,
-        )
+
+        val target = if (settlingComposition) {
+            TextReplacer.replace(current, cachedRules)
+        } else {
+            IncrementalTransformer.transform(
+                current = current,
+                previousOutput = activeSession.lastWritten,
+                change = change,
+                rules = cachedRules,
+            )
+        }
+
         val hit = target != current
         DiagnosticLog.add(
             "APP-TRANSFORM",
-            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=$composing"
+            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=false settle=$settlingComposition"
         )
 
         if (!hit) {
             activeSession.lastWritten = current
-            if (lockReplacementEnabled && activeSession.lockActive && !composing) {
+            if (lockReplacementEnabled && activeSession.lockActive) {
                 activeSession.lockedText = current
             }
             return true
         }
 
         val ok = writeIme(pkg, current, target, reason, activeSession)
-        if (ok && lockReplacementEnabled && !composing) {
+        if (ok && lockReplacementEnabled) {
             activeSession.lockActive = true
             activeSession.lockedText = target
+            DiagnosticLog.add("APP-LOCK", "armed pkg=$pkg len=${target.length}")
         }
         return ok
     }
@@ -372,6 +403,7 @@ class GlobalReplaceService : AccessibilityService() {
             "APP-IME-WRITE",
             "pkg=$pkg reason=$reason issued=${result.issued} editor=${result.editorPackage} started=${result.inputStarted} conn=${result.hasConnection} surroundingLen=${result.surroundingLength} match=${result.surroundingMatchesExpected} err=${result.error}"
         )
+
         if (!result.issued) {
             ServiceRuntimeState.markError("InputConnection 写入失败：$pkg · ${result.error}")
             return false
@@ -391,6 +423,7 @@ class GlobalReplaceService : AccessibilityService() {
         reason: String,
     ): Boolean {
         if (!isEditableTarget(node)) return false
+
         val pkg = node.packageName?.toString().orEmpty()
         if (pkg.isBlank() || pkg == packageName) return false
 
@@ -403,12 +436,30 @@ class GlobalReplaceService : AccessibilityService() {
         if (
             now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
             current == activeSession.lastWritten
-        ) return true
+        ) {
+            return true
+        }
 
         val composing = updateCompositionState(pkg, event, activeSession)
+        if (composing) {
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "defer-transform pkg=$pkg len=${current.length} pending=${activeSession.compositionPending} path=node"
+            )
+            return true
+        }
+
+        val settlingComposition = activeSession.compositionPending
+        if (settlingComposition) {
+            activeSession.compositionPending = false
+            DiagnosticLog.add(
+                "APP-COMPOSE",
+                "settled pkg=$pkg len=${current.length}; full-pass path=node"
+            )
+        }
 
         if (current.isEmpty()) {
-            if (shouldRestoreLockedDeletion(event, current, activeSession, now, composing)) {
+            if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
                 val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
                 return writeNodeOrIme(
                     node,
@@ -426,7 +477,7 @@ class GlobalReplaceService : AccessibilityService() {
             return true
         }
 
-        if (shouldRestoreLockedDeletion(event, current, activeSession, now, composing)) {
+        if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
             val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
             DiagnosticLog.add(
                 "APP-LOCK",
@@ -450,21 +501,27 @@ class GlobalReplaceService : AccessibilityService() {
             addedCount = event.addedCount,
             removedCount = event.removedCount,
         )
-        val target = IncrementalTransformer.transform(
-            current = current,
-            previousOutput = activeSession.lastWritten,
-            change = change,
-            rules = cachedRules,
-        )
+
+        val target = if (settlingComposition) {
+            TextReplacer.replace(current, cachedRules)
+        } else {
+            IncrementalTransformer.transform(
+                current = current,
+                previousOutput = activeSession.lastWritten,
+                change = change,
+                rules = cachedRules,
+            )
+        }
+
         val hit = target != current
         DiagnosticLog.add(
             "APP-TRANSFORM",
-            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=$composing path=node"
+            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=false settle=$settlingComposition path=node"
         )
 
         if (!hit) {
             activeSession.lastWritten = current
-            if (lockReplacementEnabled && activeSession.lockActive && !composing) {
+            if (lockReplacementEnabled && activeSession.lockActive) {
                 activeSession.lockedText = current
             }
             return true
@@ -480,18 +537,14 @@ class GlobalReplaceService : AccessibilityService() {
             reason,
             activeSession,
         )
-        if (ok && lockReplacementEnabled && !composing) {
+        if (ok && lockReplacementEnabled) {
             activeSession.lockActive = true
             activeSession.lockedText = target
+            DiagnosticLog.add("APP-LOCK", "armed pkg=$pkg len=${target.length} path=node")
         }
         return ok
     }
 
-    /**
-     * Detect IME composing/voice-recognition revisions. These are not user deletes.
-     * A grace period also covers the small one-character corrections that speech
-     * engines often emit immediately after a large provisional rewrite.
-     */
     private fun updateCompositionState(
         pkg: String,
         event: AccessibilityEvent?,
@@ -504,34 +557,43 @@ class GlobalReplaceService : AccessibilityService() {
         val removed = event.removedCount
         val from = event.fromIndex
         val beforeLen = event.beforeText?.length ?: activeSession.lastWritten.length
+        val alreadyComposing = now < activeSession.compositionUntil
 
         val replaceInPlace = added > 0 && removed > 0
         val fullClear =
-            added == 0 && removed > 0 && from == 0 && beforeLen > 0 && removed >= beforeLen
+            alreadyComposing &&
+                added == 0 &&
+                removed > 0 &&
+                from == 0 &&
+                beforeLen > 0 &&
+                removed >= beforeLen
         val largeDelete =
-            added == 0 && removed >= COMPOSING_LARGE_EDIT_MIN && beforeLen > 0 &&
+            alreadyComposing &&
+                added == 0 &&
+                removed >= COMPOSING_LARGE_EDIT_MIN &&
+                beforeLen > 0 &&
                 (from == 0 || removed * 3 >= beforeLen)
-        val largeHeadRewrite =
-            from == 0 && removed > 0 && added >= COMPOSING_LARGE_EDIT_MIN
 
-        if (replaceInPlace || fullClear || largeDelete || largeHeadRewrite) {
+        if (replaceInPlace || fullClear || largeDelete) {
             activeSession.compositionUntil = now + COMPOSITION_GRACE_MS
-            val reason = when {
+            activeSession.compositionPending = true
+
+            val composeReason = when {
                 fullClear -> "full-clear"
-                replaceInPlace -> "replace-in-place"
                 largeDelete -> "large-delete"
-                else -> "head-rewrite"
+                else -> "replace-in-place"
             }
+
             if (activeSession.lockActive) {
                 activeSession.clearLock()
                 DiagnosticLog.add(
                     "APP-COMPOSE",
-                    "lock-suspended pkg=$pkg reason=$reason add=$added remove=$removed from=$from beforeLen=$beforeLen"
+                    "lock-suspended pkg=$pkg reason=$composeReason add=$added remove=$removed from=$from beforeLen=$beforeLen"
                 )
             } else {
                 DiagnosticLog.add(
                     "APP-COMPOSE",
-                    "detected pkg=$pkg reason=$reason add=$added remove=$removed from=$from beforeLen=$beforeLen"
+                    "detected pkg=$pkg reason=$composeReason add=$added remove=$removed from=$from beforeLen=$beforeLen"
                 )
             }
             return true
@@ -540,7 +602,6 @@ class GlobalReplaceService : AccessibilityService() {
         return now < activeSession.compositionUntil
     }
 
-    /** Lock restoration is allowed only for a small, pure deletion event. */
     private fun shouldRestoreLockedDeletion(
         event: AccessibilityEvent?,
         current: String,
@@ -551,18 +612,16 @@ class GlobalReplaceService : AccessibilityService() {
         if (!lockReplacementEnabled || !activeSession.lockActive) return false
         if (event == null || composing) return false
         if (now <= activeSession.allowClearUntil) return false
-        if (event.addedCount != 0) return false
-        if (event.removedCount !in 1..MAX_MANUAL_LOCK_DELETE_CHARS) return false
+        if (event.addedCount != 0 || event.removedCount <= 0) return false
 
         val beforeLen = event.beforeText?.length ?: activeSession.lastWritten.length
         if (beforeLen <= 0 || current.length >= beforeLen) return false
 
-        // A one-shot full-field wipe is typical of voice/composing/send transitions.
-        // Backspace on a short locked result is still protected.
-        val wholeFieldDelete = event.fromIndex == 0 && event.removedCount >= beforeLen
-        if (wholeFieldDelete && beforeLen > MAX_SHORT_FULL_DELETE_LOCK_CHARS) return false
+        val wholeFieldDelete =
+            event.fromIndex == 0 && event.removedCount >= beforeLen
+        if (wholeFieldDelete) return true
 
-        return true
+        return event.removedCount <= MAX_MANUAL_LOCK_DELETE_CHARS
     }
 
     private fun writeNodeOrIme(
@@ -577,9 +636,13 @@ class GlobalReplaceService : AccessibilityService() {
     ): Boolean {
         val focusOk = node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, target)
+            putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                target,
+            )
         }
         val setTextOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+
         DiagnosticLog.add(
             "APP-NODE-WRITE",
             "pkg=$pkg reason=$reason focus=$focusOk setText=$setTextOk currentLen=${current.length} targetLen=${target.length}"
@@ -597,7 +660,13 @@ class GlobalReplaceService : AccessibilityService() {
 
         if (Build.VERSION.SDK_INT >= 33) {
             val imeActive = getImeSession(pkg, node.windowId)
-            val ok = writeIme(pkg, current, target, "$reason-node-fallback", imeActive)
+            val ok = writeIme(
+                pkg,
+                current,
+                target,
+                "$reason-node-fallback",
+                imeActive,
+            )
             if (ok) {
                 activeSession.lastWritten = target
                 activeSession.lastWriteAt = System.currentTimeMillis()
@@ -644,6 +713,7 @@ class GlobalReplaceService : AccessibilityService() {
             compareByDescending<AccessibilityWindowInfo> { it.isFocused }
                 .thenByDescending { it.isActive }
         )
+
         for (window in orderedWindows) {
             val root = window.root ?: continue
             try {
@@ -658,6 +728,7 @@ class GlobalReplaceService : AccessibilityService() {
                 root.recycle()
             }
         }
+
         return null
     }
 
@@ -665,6 +736,7 @@ class GlobalReplaceService : AccessibilityService() {
         if ((node.isFocused || node.isAccessibilityFocused) && isEditableTarget(node)) {
             return AccessibilityNodeInfo.obtain(node)
         }
+
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             try {
@@ -683,12 +755,14 @@ class GlobalReplaceService : AccessibilityService() {
 
         fun visit(node: AccessibilityNodeInfo, depth: Int) {
             if (depth > MAX_TREE_DEPTH) return
+
             val score = editableCandidateScore(node)
             if (score > bestScore) {
                 best?.recycle()
                 best = AccessibilityNodeInfo.obtain(node)
                 bestScore = score
             }
+
             for (i in 0 until node.childCount) {
                 val child = node.getChild(i) ?: continue
                 try {
@@ -708,6 +782,7 @@ class GlobalReplaceService : AccessibilityService() {
 
     private fun editableCandidateScore(node: AccessibilityNodeInfo): Int {
         if (node.packageName?.toString() == packageName) return 0
+
         var score = 0
         if (node.isEditable) score += 100
         if (node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) score += 100
@@ -725,7 +800,8 @@ class GlobalReplaceService : AccessibilityService() {
         if (!node.isEnabled || node.isPassword) return false
         if (node.isEditable) return true
         if (node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) return true
-        return node.className?.toString()?.contains("EditText", ignoreCase = true) == true && node.isFocusable
+        return node.className?.toString()
+            ?.contains("EditText", ignoreCase = true) == true && node.isFocusable
     }
 
     private fun nodeKey(node: AccessibilityNodeInfo): NodeKey {
@@ -743,6 +819,7 @@ class GlobalReplaceService : AccessibilityService() {
     private fun getImeSession(pkg: String, windowId: Int): InputSession {
         val current = imeSession
         if (current != null && current.key.packageName == pkg) return current
+
         val key = NodeKey(
             windowId = windowId,
             packageName = pkg,
@@ -760,6 +837,7 @@ class GlobalReplaceService : AccessibilityService() {
         oldLength: Int,
     ) {
         if (oldSelectionEnd < 0) return
+
         val delta = text.length - oldLength
         val newSelection = (oldSelectionEnd + delta).coerceIn(0, text.length)
         val args = Bundle().apply {
@@ -774,20 +852,32 @@ class GlobalReplaceService : AccessibilityService() {
         if (source != null) {
             try {
                 val id = source.viewIdResourceName?.lowercase().orEmpty()
-                val text = (source.text?.toString() ?: source.contentDescription?.toString()).orEmpty()
-                    .trim().lowercase()
+                val text =
+                    (source.text?.toString() ?: source.contentDescription?.toString())
+                        .orEmpty()
+                        .trim()
+                        .lowercase()
+
                 if (
-                    id.contains("send") || id.contains("btn_send") ||
-                    text == "发送" || text == "send" || text.contains("发送消息")
-                ) return true
+                    id.contains("send") ||
+                    id.contains("btn_send") ||
+                    text == "发送" ||
+                    text == "send" ||
+                    text.contains("发送消息")
+                ) {
+                    return true
+                }
             } finally {
                 source.recycle()
             }
         }
+
         val eventText = event.text.joinToString(" ").trim().lowercase()
         val description = event.contentDescription?.toString().orEmpty().trim().lowercase()
-        return eventText == "发送" || eventText.contains("发送消息") ||
-            description == "发送" || description.contains("发送消息")
+        return eventText == "发送" ||
+            eventText.contains("发送消息") ||
+            description == "发送" ||
+            description.contains("发送消息")
     }
 
     private fun logEvent(pkg: String, event: AccessibilityEvent) {
@@ -851,7 +941,11 @@ class GlobalReplaceService : AccessibilityService() {
         val settings = AppSettings(this)
         compatibilityScanEnabled = settings.compatibilityScanEnabled
         lockReplacementEnabled = settings.lockReplacementEnabled
-        DiagnosticLog.add("SETTINGS", "universal scan=$compatibilityScanEnabled lock=$lockReplacementEnabled")
+        DiagnosticLog.add(
+            "SETTINGS",
+            "universal scan=$compatibilityScanEnabled lock=$lockReplacementEnabled"
+        )
+
         if (!lockReplacementEnabled) {
             nodeSession?.clearLock()
             imeSession?.clearLock()
@@ -881,10 +975,12 @@ class GlobalReplaceService : AccessibilityService() {
     private fun cleanup(reason: String) {
         handler.removeCallbacks(heartbeatRunnable)
         handler.removeCallbacks(delayedScanRunnable)
+
         if (listenerRegistered) {
             prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
             listenerRegistered = false
         }
+
         nodeSession = null
         imeSession = null
         ServiceRuntimeState.markDisconnected(reason)
@@ -914,6 +1010,7 @@ class GlobalReplaceService : AccessibilityService() {
         var lockedText: String = "",
         var allowClearUntil: Long = 0L,
         var compositionUntil: Long = 0L,
+        var compositionPending: Boolean = false,
     ) {
         fun clearLock() {
             lockActive = false
@@ -923,6 +1020,7 @@ class GlobalReplaceService : AccessibilityService() {
         fun unlockForSend() {
             allowClearUntil = System.currentTimeMillis() + SEND_CLEAR_GRACE_MS
             compositionUntil = 0L
+            compositionPending = false
             clearLock()
         }
     }
@@ -942,9 +1040,8 @@ class GlobalReplaceService : AccessibilityService() {
         const val MIN_EDITABLE_CANDIDATE_SCORE = 80
         const val IME_SYNTHETIC_WINDOW_ID = -2000
 
-        const val COMPOSITION_GRACE_MS = 2800L
+        const val COMPOSITION_GRACE_MS = 1200L
         const val COMPOSING_LARGE_EDIT_MIN = 8
         const val MAX_MANUAL_LOCK_DELETE_CHARS = 8
-        const val MAX_SHORT_FULL_DELETE_LOCK_CHARS = 8
     }
 }
