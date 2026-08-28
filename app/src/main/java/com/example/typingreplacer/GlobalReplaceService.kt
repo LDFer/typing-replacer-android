@@ -2,8 +2,11 @@ package com.example.typingreplacer
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.SharedPreferences
 import android.graphics.Rect
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -12,17 +15,11 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * V2 architecture:
+ * V2 accessibility engine.
  *
- * 1. Android's AccessibilityService binding is the primary lifecycle.
- * 2. TYPE_VIEW_TEXT_CHANGED is the fast path.
- * 3. The currently focused input node is resolved explicitly; the service never
- *    blindly edits "the first editable node" on the screen.
- * 4. A low-frequency focused-node scan is only a compatibility fallback for
- *    apps/ROMs that stop emitting text-change events after the app goes to the
- *    background.
- * 5. Rules are cached in memory and reloaded only when SharedPreferences change.
- * 6. Self-generated ACTION_SET_TEXT callbacks are suppressed per input session.
+ * Text-change events are the fast path; a focused-node scan is the compatibility
+ * fallback. WeChat gets an additional focus + clipboard-paste fallback when its
+ * custom input node rejects ACTION_SET_TEXT.
  */
 class GlobalReplaceService : AccessibilityService() {
 
@@ -33,6 +30,7 @@ class GlobalReplaceService : AccessibilityService() {
 
     private var cachedRules: List<ReplacementRule> = emptyList()
     private var compatibilityScanEnabled = true
+    private var lockReplacementEnabled = false
     private var session: InputSession? = null
     private var listenerRegistered = false
 
@@ -40,7 +38,8 @@ class GlobalReplaceService : AccessibilityService() {
         SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             when (key) {
                 ReplacementRepository.KEY_RULES -> reloadRules()
-                AppSettings.KEY_COMPATIBILITY_SCAN -> reloadSettings()
+                AppSettings.KEY_COMPATIBILITY_SCAN,
+                AppSettings.KEY_LOCK_REPLACEMENT -> reloadSettings()
             }
         }
 
@@ -51,21 +50,17 @@ class GlobalReplaceService : AccessibilityService() {
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             ServiceRuntimeState.markHeartbeat()
-
             if (compatibilityScanEnabled) {
                 inspectFocusedInput(reason = "compatibility-scan")
             }
-
             handler.postDelayed(this, COMPATIBILITY_SCAN_INTERVAL_MS)
         }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-
         repository = ReplacementRepository(this)
         prefs = getSharedPreferences(AppSettings.PREFS_NAME, MODE_PRIVATE)
-
         configureService()
         reloadRules()
         reloadSettings()
@@ -77,16 +72,13 @@ class GlobalReplaceService : AccessibilityService() {
 
         session = null
         ServiceRuntimeState.markConnected()
-
         handler.removeCallbacks(heartbeatRunnable)
         handler.post(heartbeatRunnable)
-
         Log.i(TAG, "Accessibility service connected")
     }
 
     private fun configureService() {
         val info = serviceInfo ?: AccessibilityServiceInfo()
-
         info.eventTypes =
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
                 AccessibilityEvent.TYPE_VIEW_FOCUSED or
@@ -94,7 +86,6 @@ class GlobalReplaceService : AccessibilityService() {
                 AccessibilityEvent.TYPE_VIEW_CLICKED or
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                 AccessibilityEvent.TYPE_WINDOWS_CHANGED
-
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
         info.notificationTimeout = 0
         info.flags =
@@ -102,16 +93,13 @@ class GlobalReplaceService : AccessibilityService() {
                 AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-
         serviceInfo = info
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-
         val eventPackage = event.packageName?.toString()
         if (eventPackage == packageName) return
-
         ServiceRuntimeState.markEvent(eventPackage)
 
         when (event.eventType) {
@@ -120,42 +108,47 @@ class GlobalReplaceService : AccessibilityService() {
                 if (source != null) {
                     try {
                         if (isEditableTarget(source)) {
-                            processNode(
-                                node = source,
-                                event = event,
-                                reason = "text-event",
-                            )
+                            processNode(source, event, "text-event")
                             return
                         }
                     } finally {
                         source.recycle()
                     }
                 }
-
-                scheduleFocusedScan(40L)
+                scheduleFocusedScan(35L)
             }
 
             AccessibilityEvent.TYPE_VIEW_FOCUSED,
-            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
-                scheduleFocusedScan(40L)
-            }
+            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> scheduleFocusedScan(35L)
 
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
                 session = null
-                scheduleFocusedScan(100L)
+                scheduleFocusedScan(90L)
             }
 
             AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                // A click often precedes a focus transition. Refresh the target shortly after.
-                scheduleFocusedScan(60L)
+                val clicked = event.source
+                if (clicked != null) {
+                    try {
+                        if (isLikelySendButton(clicked)) {
+                            session?.apply {
+                                allowClearUntil = System.currentTimeMillis() + SEND_CLEAR_GRACE_MS
+                                lockedText = ""
+                                lockActive = false
+                            }
+                        }
+                    } finally {
+                        clicked.recycle()
+                    }
+                }
+                scheduleFocusedScan(50L)
             }
         }
     }
 
     override fun onInterrupt() {
         ServiceRuntimeState.markError("系统调用了 onInterrupt")
-        Log.w(TAG, "Accessibility service interrupted")
     }
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
@@ -171,23 +164,28 @@ class GlobalReplaceService : AccessibilityService() {
     private fun cleanup(reason: String) {
         handler.removeCallbacks(heartbeatRunnable)
         handler.removeCallbacks(delayedScanRunnable)
-
         if (listenerRegistered) {
             prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
             listenerRegistered = false
         }
-
         session = null
         ServiceRuntimeState.markDisconnected(reason)
     }
 
     private fun reloadRules() {
         cachedRules = repository.loadRules()
-        Log.i(TAG, "Rules reloaded: ${cachedRules.size}")
     }
 
     private fun reloadSettings() {
-        compatibilityScanEnabled = AppSettings(this).compatibilityScanEnabled
+        val settings = AppSettings(this)
+        compatibilityScanEnabled = settings.compatibilityScanEnabled
+        lockReplacementEnabled = settings.lockReplacementEnabled
+        if (!lockReplacementEnabled) {
+            session?.apply {
+                lockActive = false
+                lockedText = ""
+            }
+        }
     }
 
     private fun scheduleFocusedScan(delayMs: Long) {
@@ -201,39 +199,26 @@ class GlobalReplaceService : AccessibilityService() {
             ServiceRuntimeState.markNode("未找到当前焦点输入框（$reason）")
             return
         }
-
         try {
             val pkg = node.packageName?.toString()
             if (pkg == packageName) return
-
-            ServiceRuntimeState.markNode(
-                "已找到焦点输入框：${pkg.orEmpty()}（$reason）"
-            )
-            processNode(node = node, event = null, reason = reason)
+            ServiceRuntimeState.markNode("已找到焦点输入框：${pkg.orEmpty()}（$reason）")
+            processNode(node, null, reason)
         } finally {
             node.recycle()
         }
     }
 
-    /**
-     * Prefer FOCUS_INPUT. We never use the old "first editable node in the tree"
-     * strategy because pages can contain search boxes, comments and chat inputs
-     * at the same time.
-     */
     private fun findFocusedEditable(): AccessibilityNodeInfo? {
         val activeRoot = rootInActiveWindow
         if (activeRoot != null) {
             try {
                 val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                 if (focused != null) {
-                    if (isEditableTarget(focused)) {
-                        return focused
-                    }
+                    if (isEditableTarget(focused)) return focused
                     focused.recycle()
                 }
-
-                val deepFocused = findDeepFocusedEditable(activeRoot)
-                if (deepFocused != null) return deepFocused
+                findDeepFocusedEditable(activeRoot)?.let { return it }
             } finally {
                 activeRoot.recycle()
             }
@@ -243,33 +228,26 @@ class GlobalReplaceService : AccessibilityService() {
             compareByDescending<android.view.accessibility.AccessibilityWindowInfo> { it.isFocused }
                 .thenByDescending { it.isActive }
         )
-
         for (window in orderedWindows) {
             val root = window.root ?: continue
             try {
                 val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                 if (focused != null) {
-                    if (isEditableTarget(focused)) {
-                        return focused
-                    }
+                    if (isEditableTarget(focused)) return focused
                     focused.recycle()
                 }
-
-                val deepFocused = findDeepFocusedEditable(root)
-                if (deepFocused != null) return deepFocused
+                findDeepFocusedEditable(root)?.let { return it }
             } finally {
                 root.recycle()
             }
         }
-
         return null
     }
 
     private fun findDeepFocusedEditable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        if (node.isFocused && isEditableTarget(node)) {
+        if ((node.isFocused || node.isAccessibilityFocused) && isEditableTarget(node)) {
             return AccessibilityNodeInfo.obtain(node)
         }
-
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             try {
@@ -279,17 +257,19 @@ class GlobalReplaceService : AccessibilityService() {
                 child.recycle()
             }
         }
-
         return null
     }
 
     private fun isEditableTarget(node: AccessibilityNodeInfo): Boolean {
         if (!node.isEnabled || node.isPassword) return false
         if (node.isEditable) return true
+        if (node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) return true
 
-        return node.actionList.any {
-            it.id == AccessibilityNodeInfo.ACTION_SET_TEXT
-        }
+        // Some WeChat versions expose the chat field as a focusable EditText-like
+        // node without advertising isEditable/ACTION_SET_TEXT consistently.
+        return node.packageName?.toString() == WECHAT_PACKAGE &&
+            node.className?.toString()?.contains("EditText", ignoreCase = true) == true &&
+            node.isFocusable
     }
 
     private fun processNode(
@@ -302,51 +282,89 @@ class GlobalReplaceService : AccessibilityService() {
         val current = node.text?.toString() ?: ""
         val key = nodeKey(node)
         val now = System.currentTimeMillis()
+        val activeSession = session?.takeIf { it.key == key }
+            ?: InputSession(key).also { session = it }
 
-        val activeSession =
-            session?.takeIf { it.key == key }
-                ?: InputSession(key = key).also { session = it }
-
-        if (
-            now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
+        if (now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
             current == activeSession.lastWritten
-        ) {
-            return
-        }
+        ) return
 
         if (current.isEmpty()) {
-            activeSession.lastWritten = ""
+            if (
+                lockReplacementEnabled &&
+                activeSession.lockActive &&
+                activeSession.lockedText.isNotEmpty() &&
+                now > activeSession.allowClearUntil
+            ) {
+                writeText(node, activeSession.lockedText, 0, 0, "lock-restore-empty", activeSession)
+            } else {
+                activeSession.lastWritten = ""
+                activeSession.lockedText = ""
+                activeSession.lockActive = false
+            }
             return
         }
 
-        val target = computeTarget(
-            current = current,
-            event = event,
-            activeSession = activeSession,
-        )
+        // Locked text may be extended by typing, but deletion is immediately restored.
+        if (
+            lockReplacementEnabled &&
+            activeSession.lockActive &&
+            activeSession.lastWritten.isNotEmpty() &&
+            current.length < activeSession.lastWritten.length &&
+            now > activeSession.allowClearUntil
+        ) {
+            writeText(
+                node,
+                activeSession.lockedText.ifEmpty { activeSession.lastWritten },
+                node.textSelectionEnd,
+                current.length,
+                "lock-restore-delete",
+                activeSession,
+            )
+            return
+        }
 
-        if (target == current) {
+        val target = computeTarget(current, event, activeSession)
+        val replacementOccurred = target != current
+
+        if (!replacementOccurred) {
             activeSession.lastWritten = current
+            if (lockReplacementEnabled && activeSession.lockActive) {
+                activeSession.lockedText = current
+            }
             return
         }
 
-        val selectionEnd = node.textSelectionEnd
-        val ok = setNodeText(node, target, selectionEnd, current.length)
+        if (writeText(node, target, node.textSelectionEnd, current.length, reason, activeSession)) {
+            if (lockReplacementEnabled) {
+                activeSession.lockActive = true
+                activeSession.lockedText = target
+            }
+        }
+    }
 
+    private fun writeText(
+        node: AccessibilityNodeInfo,
+        text: String,
+        oldSelectionEnd: Int,
+        oldLength: Int,
+        reason: String,
+        activeSession: InputSession,
+    ): Boolean {
+        val ok = setNodeTextCompat(node, text, oldSelectionEnd, oldLength)
         if (ok) {
-            activeSession.lastWritten = target
-            activeSession.lastWriteAt = now
+            activeSession.lastWritten = text
+            activeSession.lastWriteAt = System.currentTimeMillis()
+            if (activeSession.lockActive) activeSession.lockedText = text
             ServiceRuntimeState.markReplacement(node.packageName?.toString())
             ServiceRuntimeState.markNode("替换写入成功（$reason）")
-            Log.d(TAG, "replace[$reason] '$current' -> '$target'")
         } else {
-            activeSession.lastWritten = current
             ServiceRuntimeState.markError(
-                "ACTION_SET_TEXT 被目标应用拒绝：${node.packageName?.toString().orEmpty()}"
+                "无法写入目标输入框：${node.packageName?.toString().orEmpty()}"
             )
-            ServiceRuntimeState.markNode("找到输入框，但 ACTION_SET_TEXT 失败（$reason）")
-            Log.w(TAG, "ACTION_SET_TEXT failed for ${node.packageName}")
+            ServiceRuntimeState.markNode("找到输入框，但写入失败（$reason）")
         }
+        return ok
     }
 
     private fun computeTarget(
@@ -354,18 +372,12 @@ class GlobalReplaceService : AccessibilityService() {
         event: AccessibilityEvent?,
         activeSession: InputSession,
     ): String {
-        val change =
-            if (event == null) {
-                null
-            } else {
-                IncrementalTransformer.Change(
-                    beforeText = event.beforeText?.toString(),
-                    fromIndex = event.fromIndex,
-                    addedCount = event.addedCount,
-                    removedCount = event.removedCount,
-                )
-            }
-
+        val change = if (event == null) null else IncrementalTransformer.Change(
+            beforeText = event.beforeText?.toString(),
+            fromIndex = event.fromIndex,
+            addedCount = event.addedCount,
+            removedCount = event.removedCount,
+        )
         return IncrementalTransformer.transform(
             current = current,
             previousOutput = activeSession.lastWritten,
@@ -377,7 +389,6 @@ class GlobalReplaceService : AccessibilityService() {
     private fun nodeKey(node: AccessibilityNodeInfo): NodeKey {
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
-
         return NodeKey(
             windowId = node.windowId,
             packageName = node.packageName?.toString().orEmpty(),
@@ -387,44 +398,84 @@ class GlobalReplaceService : AccessibilityService() {
         )
     }
 
-    private fun setNodeText(
+    private fun setNodeTextCompat(
         node: AccessibilityNodeInfo,
         text: String,
         oldSelectionEnd: Int,
         oldLength: Int,
     ): Boolean {
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+
         val args = Bundle().apply {
-            putCharSequence(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                text,
-            )
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        }
+        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+            restoreSelection(node, text, oldSelectionEnd, oldLength)
+            return true
         }
 
-        val ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        if (!ok) return false
+        if (node.packageName?.toString() != WECHAT_PACKAGE) return false
+        return pasteFallback(node, text)
+    }
 
-        // ACTION_SET_TEXT often moves the cursor to the end. Restore an approximate
-        // logical position when the app supports ACTION_SET_SELECTION.
-        if (oldSelectionEnd >= 0) {
-            val delta = text.length - oldLength
-            val newSelection = (oldSelectionEnd + delta).coerceIn(0, text.length)
-            val selectionArgs = Bundle().apply {
-                putInt(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT,
-                    newSelection,
-                )
-                putInt(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,
-                    newSelection,
-                )
+    private fun restoreSelection(
+        node: AccessibilityNodeInfo,
+        text: String,
+        oldSelectionEnd: Int,
+        oldLength: Int,
+    ) {
+        if (oldSelectionEnd < 0) return
+        val delta = text.length - oldLength
+        val newSelection = (oldSelectionEnd + delta).coerceIn(0, text.length)
+        val selectionArgs = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newSelection)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newSelection)
+        }
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
+    }
+
+    private fun pasteFallback(node: AccessibilityNodeInfo, text: String): Boolean {
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        val oldClip = clipboard.primaryClip
+
+        val selectionArgs = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+            putInt(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,
+                (node.text?.length ?: 0),
+            )
+        }
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
+        clipboard.setPrimaryClip(ClipData.newPlainText("typing-replacer", text))
+        val ok = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+
+        handler.postDelayed({
+            try {
+                if (oldClip != null) {
+                    clipboard.setPrimaryClip(oldClip)
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    clipboard.clearPrimaryClip()
+                } else {
+                    clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
+                }
+            } catch (_: Exception) {
             }
-            node.performAction(
-                AccessibilityNodeInfo.ACTION_SET_SELECTION,
-                selectionArgs,
-            )
-        }
+        }, 180L)
 
-        return true
+        if (ok) ServiceRuntimeState.markNode("微信兼容粘贴写入成功")
+        return ok
+    }
+
+    private fun isLikelySendButton(node: AccessibilityNodeInfo): Boolean {
+        val id = node.viewIdResourceName?.lowercase().orEmpty()
+        val text = (node.text?.toString() ?: node.contentDescription?.toString()).orEmpty()
+            .trim().lowercase()
+        return id.contains("send") ||
+            id.contains("btn_send") ||
+            text == "发送" ||
+            text == "send" ||
+            text.contains("发送消息")
     }
 
     private data class NodeKey(
@@ -439,11 +490,16 @@ class GlobalReplaceService : AccessibilityService() {
         val key: NodeKey,
         var lastWritten: String = "",
         var lastWriteAt: Long = 0L,
+        var lockActive: Boolean = false,
+        var lockedText: String = "",
+        var allowClearUntil: Long = 0L,
     )
 
     private companion object {
         const val TAG = "TypingReplacer"
+        const val WECHAT_PACKAGE = "com.tencent.mm"
         const val SELF_WRITE_GUARD_MS = 1200L
         const val COMPATIBILITY_SCAN_INTERVAL_MS = 700L
+        const val SEND_CLEAR_GRACE_MS = 1800L
     }
 }
