@@ -342,7 +342,7 @@ class GlobalReplaceService : AccessibilityService() {
         } else {
             activeSession.lastWritten = current
             ServiceRuntimeState.markError(
-                "ACTION_SET_TEXT 被目标应用拒绝：${node.packageName.orEmpty()}"
+                "ACTION_SET_TEXT 被目标应用拒绝：${node.packageName?.toString().orEmpty()}"
             )
             ServiceRuntimeState.markNode("找到输入框，但 ACTION_SET_TEXT 失败（$reason）")
             Log.w(TAG, "ACTION_SET_TEXT failed for ${node.packageName}")
