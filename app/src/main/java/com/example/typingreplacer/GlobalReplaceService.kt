@@ -16,12 +16,15 @@ import android.view.accessibility.AccessibilityWindowInfo
 /**
  * Universal replacement service.
  *
- * Fast path: editable AccessibilityNodeInfo.
- * Android 13+ fallback: current accessibility InputConnection for any app.
+ * Node path: use AccessibilityNodeInfo when the target exposes a real editable node.
+ * IME-only path (Android 13+): never rewrite a live InputConnection directly from
+ * TYPE_VIEW_TEXT_CHANGED. Accessibility events can lag behind the editor snapshot,
+ * while speech/predictive IMEs keep their own composing buffer. Rewriting during that
+ * window can make the IME append its stale buffer to our already-rewritten text.
  *
- * IME composing/voice revisions are observed but not rewritten in real time.
- * Once the editor is stable, one full replacement pass runs and lock mode is
- * re-armed on the resulting text.
+ * Instead, IME-only edits are debounced. The service waits until the editor is stable,
+ * reads the final text again, performs one replacement, then re-arms lock mode.
+ * A locked, clearly manual deletion is the only immediate IME write exception.
  */
 class GlobalReplaceService : AccessibilityService() {
 
@@ -50,6 +53,20 @@ class GlobalReplaceService : AccessibilityService() {
         inspectCurrentEditor("event-scan")
     }
 
+    private val imeSettleRunnable = Runnable {
+        val session = imeSession ?: return@Runnable
+        if (!session.imeSettlePending) return@Runnable
+
+        val now = System.currentTimeMillis()
+        val remaining = session.imeSettleUntil - now
+        if (remaining > 0L) {
+            handler.postDelayed(imeSettleRunnable, remaining.coerceAtLeast(1L))
+            return@Runnable
+        }
+
+        processImeSnapshot(session.key.packageName, "ime-stable-settle")
+    }
+
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             ServiceRuntimeState.markHeartbeat()
@@ -76,12 +93,12 @@ class GlobalReplaceService : AccessibilityService() {
         ServiceRuntimeState.markConnected()
         DiagnosticLog.add(
             "SERVICE",
-            "universal connected rules=${cachedRules.size} scan=$compatibilityScanEnabled lock=$lockReplacementEnabled sdk=${Build.VERSION.SDK_INT}"
+            "stable-ime connected rules=${cachedRules.size} scan=$compatibilityScanEnabled lock=$lockReplacementEnabled sdk=${Build.VERSION.SDK_INT}",
         )
 
         handler.removeCallbacks(heartbeatRunnable)
         handler.post(heartbeatRunnable)
-        Log.i(TAG, "Universal accessibility service connected")
+        Log.i(TAG, "Stable IME accessibility service connected")
     }
 
     private fun configureService() {
@@ -101,7 +118,7 @@ class GlobalReplaceService : AccessibilityService() {
             info.flags or
                 AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                AcccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         if (Build.VERSION.SDK_INT >= 33) {
             flags = flags or AccessibilityServiceInfo.FLAG_INPUT_METHOD_EDITOR
         }
@@ -110,7 +127,7 @@ class GlobalReplaceService : AccessibilityService() {
 
         DiagnosticLog.add(
             "SERVICE",
-            "universal configured eventTypes=${info.eventTypes} flags=${info.flags} imeFlag=${Build.VERSION.SDK_INT >= 33}"
+            "stable-ime configured eventTypes=${info.eventTypes} flags=${info.flags} imeFlag=${Build.VERSION.SDK_INT >= 33}",
         )
     }
 
@@ -131,7 +148,7 @@ class GlobalReplaceService : AccessibilityService() {
             AccessibilityEvent.TYPE_VIEW_FOCUSED -> scheduleScan(FOCUS_SCAN_DELAY_MS)
 
             AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
-                // No scan: selection churn is especially noisy during composing.
+                // Selection churn is extremely noisy after commitText and during speech.
             }
 
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
@@ -145,7 +162,10 @@ class GlobalReplaceService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
                 nodeSession = null
-                if (imeSession?.key?.packageName != pkg) imeSession = null
+                // Do not clear the IME session just because the keyboard/SystemUI
+                // opened its own window. The actual editor package is verified by
+                // AccessibilityImeBridge and getImeSession() replaces the session
+                // only when the active editor itself changes.
                 scheduleScan(WINDOW_SCAN_DELAY_MS)
             }
 
@@ -153,6 +173,7 @@ class GlobalReplaceService : AccessibilityService() {
                 if (isLikelySendEvent(event)) {
                     nodeSession?.unlockForSend()
                     imeSession?.unlockForSend()
+                    handler.removeCallbacks(imeSettleRunnable)
                     DiagnosticLog.add("FLOW", "send-like click pkg=$pkg")
                 }
                 scheduleScan(CLICK_SCAN_DELAY_MS)
@@ -173,58 +194,65 @@ class GlobalReplaceService : AccessibilityService() {
             }
         }
 
-        return Build.VERSION.SDK_INT >= 33 &&
-            processImeEvent(pkg, event, "text-event-ime")
+        return Build.VERSION.SDK_INT >= 33 && processImeEvent(pkg, event)
     }
 
-    private fun processImeEvent(
-        pkg: String,
-        event: AccessibilityEvent,
-        reason: String,
-    ): Boolean {
+    private fun processImeEvent(pkg: String, event: AccessibilityEvent): Boolean {
         if (Build.VERSION.SDK_INT < 33) return false
 
-        val activeSession = getImeSession(pkg, event.windowId)
+        val session = getImeSession(pkg, event.windowId)
         val derived = deriveCurrentText(event)
 
         if (derived == null) {
-            updateCompositionState(pkg, event, activeSession)
             DiagnosticLog.add(
                 "APP-IME",
-                "event-text-unavailable pkg=$pkg beforeLen=${event.beforeText?.length ?: -1}"
+                "event-text-unavailable pkg=$pkg beforeLen=${event.beforeText?.length ?: -1}",
             )
-            return processImeSnapshot(pkg, "$reason-snapshot")
+            val snapshot = AccessibilityImeBridge.snapshot(this, pkg)
+            logImeSnapshot(pkg, snapshot)
+            if (!snapshot.ready || snapshot.text == null) {
+                markImeEditForSettle(pkg, event, session, null)
+                return false
+            }
+            return processImeCurrent(
+                pkg = pkg,
+                current = snapshot.text,
+                event = event,
+                reason = "text-event-ime-snapshot",
+                activeSession = session,
+            )
         }
 
+        DiagnosticLog.add(
+            "APP-IME",
+            "event pkg=$pkg mode=${derived.mode} len=${derived.text.length} beforeLen=${event.beforeText?.length ?: -1} from=${event.fromIndex} add=${event.addedCount} remove=${event.removedCount}",
+        )
+
         if (!derived.confident) {
-            updateCompositionState(pkg, event, activeSession)
             val snapshot = AccessibilityImeBridge.snapshot(this, pkg)
             DiagnosticLog.add(
                 "APP-IME",
-                "uncertain-event pkg=$pkg mode=${derived.mode} rawLen=${derived.rawLength} snapshotReady=${snapshot.ready} conn=${snapshot.hasConnection} err=${snapshot.error}"
+                "uncertain-event pkg=$pkg mode=${derived.mode} rawLen=${derived.rawLength} snapshotReady=${snapshot.ready} conn=${snapshot.hasConnection} err=${snapshot.error}",
             )
             if (snapshot.ready && snapshot.text != null) {
                 return processImeCurrent(
                     pkg = pkg,
                     current = snapshot.text,
-                    event = null,
-                    reason = "$reason-snapshot-confirmed",
-                    activeSession = activeSession,
+                    event = event,
+                    reason = "text-event-ime-snapshot-confirmed",
+                    activeSession = session,
                 )
             }
+            markImeEditForSettle(pkg, event, session, null)
             return false
         }
 
-        DiagnosticLog.add(
-            "APP-IME",
-            "event pkg=$pkg mode=${derived.mode} len=${derived.text.length} beforeLen=${event.beforeText?.length ?: -1} from=${event.fromIndex} add=${event.addedCount} remove=${event.removedCount}"
-        )
         return processImeCurrent(
             pkg = pkg,
             current = derived.text,
             event = event,
-            reason = reason,
-            activeSession = activeSession,
+            reason = "text-event-ime",
+            activeSession = session,
         )
     }
 
@@ -266,10 +294,7 @@ class GlobalReplaceService : AccessibilityService() {
         if (Build.VERSION.SDK_INT < 33) return false
 
         val snapshot = AccessibilityImeBridge.snapshot(this, pkg)
-        DiagnosticLog.add(
-            "APP-IME",
-            "snapshot expected=${pkg.orEmpty()} editor=${snapshot.editorPackage} ready=${snapshot.ready} started=${snapshot.inputStarted} conn=${snapshot.hasConnection} len=${snapshot.text?.length ?: -1} sel=${snapshot.selectionStart}..${snapshot.selectionEnd} err=${snapshot.error}"
-        )
+        logImeSnapshot(pkg, snapshot)
         if (!snapshot.ready || snapshot.text == null) return false
         if (snapshot.editorPackage == packageName || snapshot.editorPackage.isBlank()) return false
 
@@ -279,6 +304,13 @@ class GlobalReplaceService : AccessibilityService() {
             event = null,
             reason = reason,
             activeSession = getImeSession(snapshot.editorPackage, IME_SYNTHETIC_WINDOW_ID),
+        )
+    }
+
+    private fun logImeSnapshot(expectedPkg: String?, snapshot: AccessibilityImeBridge.Snapshot) {
+        DiagnosticLog.add(
+            "APP-IME",
+            "snapshot expected=${expectedPkg.orEmpty()} editor=${snapshot.editorPackage} ready=${snapshot.ready} started=${snapshot.inputStarted} conn=${snapshot.hasConnection} len=${snapshot.text?.length ?: -1} sel=${snapshot.selectionStart}..${snapshot.selectionEnd} err=${snapshot.error}",
         )
     }
 
@@ -294,76 +326,68 @@ class GlobalReplaceService : AccessibilityService() {
         if (
             now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
             current == activeSession.lastWritten
-        ) {
+         ) {
             DiagnosticLog.add("APP-IME", "self-write pkg=$pkg len=${current.length}")
             return true
         }
 
         val composing = updateCompositionState(pkg, event, activeSession)
 
-        if (composing) {
+        // Locked manual deletion remains immediate. It is deliberately evaluated
+        // before the IME stability queue so the protected text visibly snaps back.
+        if (shouldRestoreLockedDeletion(event, current, activeSession, now, composing)) {
+            val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
             DiagnosticLog.add(
-                "APP-COMPOSE",
-                "defer-transform pkg=$pkg len=${current.length} pending=${activeSession.compositionPending}"
+                "APP-LOCK",
+                "restore-delete pkg=$pkg currentLen=${current.length} lastLen=${activeSession.lastWritten.length} restoreLen=${restore.length}",
             )
+            return writeIme(pkg, current, restore, "lock-restore-delete-ime", activeSession)
+        }
+
+        if (event != null) {
+            markImeEditForSettle(pkg, event, activeSession, current)
             return true
         }
 
-        val settlingComposition = activeSession.compositionPending
-        if (settlingComposition) {
+        // A compatibility/content scan may observe a newer editor state before the
+        // queued TEXT_CHANGED callback arrives. Never transform that snapshot until
+        // the IME-only stream has been quiet for the configured settle interval.
+        if (activeSession.imeSettlePending) {
+            val remaining = activeSession.imeSettleUntil - now
+            if (remaining > 0L) {
+                DiagnosticLog.add(
+                    "APP-COMPOSE",
+                    "defer-transform pkg=$pkg len=${current.length} pending=true reason=ime-stability remainingMs=$remaining",
+                )
+                scheduleImeSettle(activeSession)
+                return true
+            }
+
+            activeSession.imeSettlePending = false
             activeSession.compositionPending = false
+            activeSession.compositionUntil = 0L
             DiagnosticLog.add(
                 "APP-COMPOSE",
-                "settled pkg=$pkg len=${current.length}; full-pass"
+                "settled pkg=$pkg len=${current.length}; stable-ime-pass",
             )
         }
 
         if (current.isEmpty()) {
-            if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
-                val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
-                DiagnosticLog.add(
-                    "APP-LOCK",
-                    "restore-empty pkg=$pkg restoreLen=${restore.length}"
-                )
-                return writeIme(pkg, current, restore, "lock-restore-empty-ime", activeSession)
-            }
-
             activeSession.lastWritten = ""
             activeSession.clearLock()
             return true
         }
 
-        if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
-            val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
-            DiagnosticLog.add(
-                "APP-LOCK",
-                "restore-delete pkg=$pkg currentLen=${current.length} lastLen=${activeSession.lastWritten.length} restoreLen=${restore.length}"
-            )
-            return writeIme(pkg, current, restore, "lock-restore-delete-ime", activeSession)
-        }
-
-        val change = if (event == null) null else IncrementalTransformer.Change(
-            beforeText = event.beforeText?.toString(),
-            fromIndex = event.fromIndex,
-            addedCount = event.addedCount,
-            removedCount = event.removedCount,
+        val target = IncrementalTransformer.transform(
+            current = current,
+            previousOutput = activeSession.lastWritten,
+            change = null,
+            rules = cachedRules,
         )
-
-        val target = if (settlingComposition) {
-            TextReplacer.replace(current, cachedRules)
-        } else {
-            IncrementalTransformer.transform(
-                current = current,
-                previousOutput = activeSession.lastWritten,
-                change = change,
-                rules = cachedRules,
-            )
-        }
-
         val hit = target != current
         DiagnosticLog.add(
             "APP-TRANSFORM",
-            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=false settle=$settlingComposition"
+            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=false settle=false stableIme=true",
         )
 
         if (!hit) {
@@ -381,6 +405,42 @@ class GlobalReplaceService : AccessibilityService() {
             DiagnosticLog.add("APP-LOCK", "armed pkg=$pkg len=${target.length}")
         }
         return ok
+    }
+
+    private fun markImeEditForSettle(
+        pkg: String,
+        event: AccessibilityEvent,
+        activeSession: InputSession,
+        current: String?,
+    ) {
+        val now = System.currentTimeMillis()
+        val batch = isImeBatchEdit(event)
+        val composing = now < activeSession.compositionUntil || batch
+        val delay = if (composing) IME_COMPOSING_SETTLE_MS else IME_SINGLE_EDIT_SETTLE_MS
+
+        activeSession.imeSettlePending = true
+        activeSession.imeSettleUntil = now + delay
+        activeSession.lastObservedAt = now
+
+        DiagnosticLog.add(
+            "APP-COMPOSE",
+            "defer-transform pkg=$pkg len=${current?.length ?: -1} pending=true reason=ime-stability delayMs=$delay batch=$batch add=${event.addedCount} remove=${event.removedCount}",
+        )
+        scheduleImeSettle(activeSession)
+    }
+
+    private fun scheduleImeSettle(session: InputSession) {
+        if (imeSession !== session || !session.imeSettlePending) return
+        handler.removeCallbacks(imeSettleRunnable)
+        val delay = (session.imeSettleUntil - System.currentTimeMillis()).coerceAtLeast(1L)
+        handler.postDelayed(imeSettleRunnable, delay)
+    }
+
+    private fun isImeBatchEdit(event: AccessibilityEvent): Boolean {
+        if (event.addedCount >= IME_BATCH_ADD_MIN) return true
+        if (event.addedCount > 0 && event.removedCount > 0) return true
+        if (event.removedCount >= IME_BATCH_REMOVE_MIN) return true
+        return false
     }
 
     private fun writeIme(
@@ -401,7 +461,7 @@ class GlobalReplaceService : AccessibilityService() {
         )
         DiagnosticLog.add(
             "APP-IME-WRITE",
-            "pkg=$pkg reason=$reason issued=${result.issued} editor=${result.editorPackage} started=${result.inputStarted} conn=${result.hasConnection} surroundingLen=${result.surroundingLength} match=${result.surroundingMatchesExpected} err=${result.error}"
+            "pkg=$pkg reason=$reason issued=${result.issued} editor=${result.editorPackage} started=${result.inputStarted} conn=${result.hasConnection} surroundingLen=${result.surroundingLength} match=${result.surroundingMatchesExpected} err=${result.error}",
         )
 
         if (!result.issued) {
@@ -413,635 +473,289 @@ class GlobalReplaceService : AccessibilityService() {
         activeSession.lastWriteAt = System.currentTimeMillis()
         if (activeSession.lockActive) activeSession.lockedText = target
         ServiceRuntimeState.markReplacement(pkg)
-        ServiceRuntimeState.markNode("InputConnection å†™å…¥æˆåŠŸï¼š$pkgï¼ˆ$reasonï¼‰")
-        return true
-    }
-
-    private fun processNode(
-        node: AccessibilityNodeInfo,
-        event: AccessibilityEvent?,
-        reason: String,
-    ): Boolean {
-        if (!isEditableTarget(node)) return false
-
-        val pkg = node.packageName?.toString().orEmpty()
-        if (pkg.isBlank() || pkg == packageName) return false
-
-        val current = node.text?.toString() ?: ""
-        val key = nodeKey(node)
-        val now = System.currentTimeMillis()
-        val activeSession = nodeSession?.takeIf { it.key == key }
-            ?: InputSession(key).also { nodeSession = it }
-
-        if (
-            now - activeSession.lastWriteAt <= SELF_WRITE_GUARD_MS &&
-            current == activeSession.lastWritten
-        ) {
-            return true
-        }
-
-        val composing = updateCompositionState(pkg, event, activeSession)
-        if (composing) {
-            DiagnosticLog.add(
-                "APP-COMPOSE",
-                "defer-transform pkg=$pkg len=${current.length} pending=${activeSession.compositionPending} path=node"
-            )
-            return true
-        }
-
-        val settlingComposition = activeSession.compositionPending
-        if (settlingComposition) {
-            activeSession.compositionPending = false
-            DiagnosticLog.add(
-                "APP-COMPOSE",
-                "settled pkg=$pkg len=${current.length}; full-pass path=node"
-            )
-        }
-
-        if (current.isEmpty()) {
-            if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
-                val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
-                return writeNodeOrIme(
-                    node,
-                    pkg,
-                    current,
-                    restore,
-                    0,
-                    0,
-                    "lock-restore-empty",
-                    activeSession,
-                )
-            }
-            activeSession.lastWritten = ""
-            activeSession.clearLock()
-            return true
-        }
-
-        if (shouldRestoreLockedDeletion(event, current, activeSession, now, false)) {
-            val restore = activeSession.lockedText.ifEmpty { activeSession.lastWritten }
-            DiagnosticLog.add(
-                "APP-LOCK",
-                "restore-delete-node pkg=$pkg currentLen=${current.length} lastLen=${activeSession.lastWritten.length} restoreLen=${restore.length}"
-            )
-            return writeNodeOrIme(
-                node,
-                pkg,
-                current,
-                restore,
-                node.textSelectionEnd,
-                current.length,
-                "lock-restore-delete",
-                activeSession,
-            )
-        }
-
-        val change = if (event == null) null else IncrementalTransformer.Change(
-            beforeText = event.beforeText?.toString(),
-            fromIndex = event.fromIndex,
-            addedCount = event.addedCount,
-            removedCount = event.removedCount,
-        )
-
-        val target = if (settlingComposition) {
-            TextReplacer.replace(current, cachedRules)
-        } else {
-            IncrementalTransformer.transform(
-                current = current,
-                previousOutput = activeSession.lastWritten,
-                change = change,
-                rules = cachedRules,
-            )
-        }
-
-        val hit = target != current
-        DiagnosticLog.add(
-            "APP-TRANSFORM",
-            "pkg=$pkg replacement=$hit currentLen=${current.length} targetLen=${target.length} composing=false settle=$settlingComposition path=node"
-        )
-
-        if (!hit) {
-            activeSession.lastWritten = current
-            if (lockReplacementEnabled && activeSession.lockActive) {
-                activeSession.lockedText = current
-            }
-            return true
-        }
-
-        val ok = writeNodeOrIme(
-            node,
-            pkg,
-            current,
-            target,
-            node.textSelectionEnd,
-            current.length,
-            reason,
-            activeSession,
-        )
-        if (ok && lockReplacementEnabled) {
-            activeSession.lockActive = true
-            activeSession.lockedText = target
-            DiagnosticLog.add("APP-LOCK", "armed pkg=$pkg len=${target.length} path=node")
-        }
-        return ok
-    }
-
-    private fun updateCompositionState(
-        pkg: String,
-        event: AccessibilityEvent?,
-        activeSession: InputSession,
-    ): Boolean {
-        val now = System.currentTimeMillis()
-        if (event == null) return now < activeSession.compositionUntil
-
-        val added = event.addedCount
-        val removed = event.removedCount
-        val from = event.fromIndex
-        val beforeLen = event.beforeText?.length ?: activeSession.lastWritten.length
-        val alreadyComposing = now < activeSession.compositionUntil
-
-        val replaceInPlace = added > 0 && removed > 0
-        val fullClear =
-            alreadyComposing &&
-                added == 0 &&
-                removed > 0 &&
-                from == 0 &&
-                beforeLen > 0 &&
-                removed >= beforeLen
-        val largeDelete =
-            alreadyComposing &&
-                added == 0 &&
-                removed >= COMPOSING_LARGE_EDIT_MIN &&
-                beforeLen > 0 &&
-                (from == 0 || removed * 3 >= beforeLen)
-
-        if (replaceInPlace || fullClear || largeDelete) {
-            activeSession.compositionUntil = now + COMPOSITION_GRACE_MS
-            activeSession.compositionPending = true
-
-            val composeReason = when {
-                fullClear -> "full-clear"
-                largeDelete -> "large-delete"
-                else -> "replace-in-place"
-            }
-
-            if (activeSession.lockActive) {
-                activeSession.clearLock()
-                DiagnosticLog.add(
-                    "APP-COMPOSE",
-                    "lock-suspended pkg=$pkg reason=$composeReason add=$added remove=$removed from=$from beforeLen=$beforeLen"
-                )
-            } else {
-                DiagnosticLog.add(
-                    "APP-COMPOSE",
-                    "detected pkg=$pkg reason=$composeReason add=$added remove=$removed from=$from beforeLen=$beforeLen"
-                )
-            }
-            return true
-        }
-
-        return now < activeSession.compositionUntil
-    }
-
-    private fun shouldRestoreLockedDeletion(
-        event: AccessibilityEvent?,
-        current: String,
-        activeSession: InputSession,
-        now: Long,
-        composing: Boolean,
-    ): Boolean {
-        if (!lockReplacementEnabled || !activeSession.lockActive) return false
-        if (event == null || composing) return false
-        if (now <= activeSession.allowClearUntil) return false
-        if (event.addedCount != 0 || event.removedCount <= 0) return false
-
-        val beforeLen = event.beforeText?.length ?: activeSession.lastWritten.length
-        if (beforeLen <= 0 || current.length >= beforeLen) return false
-
-        val wholeFieldDelete =
-            event.fromIndex == 0 && event.removedCount >= beforeLen
-        if (wholeFieldDelete) return true
-
-        return event.removedCount <= MAX_MANUAL_LOCK_DELETE_CHARS
-    }
-
-    private fun writeNodeOrIme(
-        node: AccessibilityNodeInfo,
-        pkg: String,
-        current: String,
-        target: String,
-        oldSelectionEnd: Int,
-        oldLength: Int,
-        reason: String,
-        activeSession: InputSession,
-    ): Boolean {
-        val focusOk = node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        val args = Bundle().apply {
-            putCharSequence(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                target,
-            )
-        }
-        val setTextOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-
-        DiagnosticLog.add(
-            "APP-NODE-WRITE",
-            "pkg=$pkg reason=$reason focus=$focusOk setText=$setTextOk currentLen=${current.length} targetLen=${target.length}"
-        )
-
-        if (setTextOk) {
-            restoreSelection(node, target, oldSelectionEnd, oldLength)
-            activeSession.lastWritten = target
-            activeSession.lastWriteAt = System.currentTimeMillis()
-            if (activeSession.lockActive) activeSession.lockedText = target
-            ServiceRuntimeState.markReplacement(pkg)
-            ServiceRuntimeState.markNode("AccessibilityNode å†™å…¥æˆåŠŸï¼š$pkgï¼ˆ$reasonï¼‰")
-            return true
-        }
-
-        if (Build.VERSION.SDK_INT >= 33) {
-            val imeActive = getImeSession(pkg, node.windowId)
-            val ok = writeIme(
-                pkg,
-                current,
-                target,
-                "$reason-node-fallback",
-                imeActive,
-            )
-            if (ok) {
-                activeSession.lastWritten = target
-                activeSession.lastWriteAt = System.currentTimeMillis()
-                if (activeSession.lockActive) activeSession.lockedText = target
-                return true
-            }
-        }
-
-        ServiceRuntimeState.markError("èŠ‚ç‚¹å’Œ InputConnection å‡æ— æ³•å†™å…¥ï¼š$pkg")
-        return false
-    }
-
-    private fun inspectCurrentEditor(reason: String) {
-        val node = findFocusedEditable()
-        if (node != null) {
-            try {
-                if (processNode(node, null, reason)) return
-            } finally {
-                node.recycle()
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= 33 && processImeSnapshot(null, "$reason-ime")) return
-        ServiceRuntimeState.markNode("æœªæ‰¾åˆ°å¯ç”¨è¾“å…¥ç¼–è¾‘å™¨ï¼ˆ$reasonï¼‰")
-    }
-
-    private fun findFocusedEditable(): AccessibilityNodeInfo? {
-        val activeRoot = rootInActiveWindow
-        if (activeRoot != null) {
-            try {
-                val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                if (focused != null) {
-                    if (isEditableTarget(focused)) return focused
-                    focused.recycle()
-                }
-                findDeepFocusedEditable(activeRoot)?.let { return it }
-                findBestEditableCandidate(activeRoot)?.let { return it }
-            } finally {
-                activeRoot.recycle()
-            }
-        }
-
-        val orderedWindows = windows.sortedWith(
-            compareByDescending<AccessibilityWindowInfo> { it.isFocused }
-                .thenByDescending { it.isActive }
-        )
-
-        for (window in orderedWindows) {
-            val root = window.root ?: continue
-            try {
-                val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                if (focused != null) {
-                    if (isEditableTarget(focused)) return focused
-                    focused.recycle()
-                }
-                findDeepFocusedEditable(root)?.let { return it }
-                findBestEditableCandidate(root)?.let { return it }
-            } finally {
-                root.recycle()
-            }
-        }
-
-        return null
-    }
-
-    private fun findDeepFocusedEditable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        if ((node.isFocused || node.isAccessibilityFocused) && isEditableTarget(node)) {
-            return AccessibilityNodeInfo.obtain(node)
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            try {
-                val found = findDeepFocusedEditable(child)
-                if (found != null) return found
-            } finally {
-                child.recycle()
-            }
-        }
-        return null
-    }
-
-    private fun findBestEditableCandidate(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        var best: AccessibilityNodeInfo? = null
-        var bestScore = 0
-
-        fun visit(node: AccessibilityNodeInfo, depth: Int) {
-            if (depth > MAX_TREE_DEPTH) return
-
-            val score = editableCandidateScore(node)
-            if (score > bestScore) {
-                best?.recycle()
-                best = AccessibilityNodeInfo.obtain(node)
-                bestScore = score
-            }
-
-            for (i in 0 until node.childCount) {
-                val child = node.getChild(i) ?: continue
-                try {
-                    visit(child, depth + 1)
-                } finally {
-                    child.recycle()
-                }
-            }
-        }
-
-        visit(root, 0)
-        return if (bestScore >= MIN_EDITABLE_CANDIDATE_SCORE) best else {
-            best?.recycle()
-            null
-        }
-    }
-
-    private fun editableCandidateScore(node: AccessibilityNodeInfo): Int {
-        if (node.packageName?.toString() == packageName) return 0
-
-        var score = 0
-        if (node.isEditable) score += 100
-        if (node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) score += 100
-        if (node.className?.toString()?.contains("EditText", ignoreCase = true) == true) score += 80
-        if (node.isFocused) score += 50
-        if (node.isAccessibilityFocused) score += 30
-        if (node.isFocusable) score += 20
-        if (node.isEnabled) score += 10
-        if (node.isVisibleToUser) score += 10
-        if (node.textSelectionStart >= 0 || node.textSelectionEnd >= 0) score += 20
-        return score
-    }
-
-    private fun isEditableTarget(node: AccessibilityNodeInfo): Boolean {
-        if (!node.isEnabled || node.isPassword) return false
-        if (node.isEditable) return true
-        if (node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }) return true
-        return node.className?.toString()
-            ?.contains("EditText", ignoreCase = true) == true && node.isFocusable
-    }
-
-    private fun nodeKey(node: AccessibilityNodeInfo): NodeKey {
-        val bounds = Rect()
-        node.getBoundsInScreen(bounds)
-        return NodeKey(
-            windowId = node.windowId,
-            packageName = node.packageName?.toString().orEmpty(),
-            viewId = node.viewIdResourceName.orEmpty(),
-            className = node.className?.toString().orEmpty(),
-            bounds = "${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}",
-        )
-    }
-
-    private fun getImeSession(pkg: String, windowId: Int): InputSession {
-        val current = imeSession
-        if (current != null && current.key.packageName == pkg) return current
-
-        val key = NodeKey(
-            windowId = windowId,
-            packageName = pkg,
-            viewId = "@accessibility-ime",
-            className = "InputConnection",
-            bounds = "",
-        )
-        return InputSession(key).also { imeSession = it }
-    }
-
-    private fun restoreSelection(
-        node: AccessibilityNodeInfo,
-        text: String,
-        oldSelectionEnd: Int,
-        oldLength: Int,
-    ) {
-        if (oldSelectionEnd < 0) return
-
-        val delta = text.length - oldLength
-        val newSelection = (oldSelectionEnd + delta).coerceIn(0, text.length)
-        val args = Bundle().apply {
-            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newSelection)
-            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newSelection)
-        }
-        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
-    }
-
-    private fun isLikelySendEvent(event: AccessibilityEvent): Boolean {
-        val source = event.source
-        if (source != null) {
-            try {
-                val id = source.viewIdResourceName?.lowercase().orEmpty()
-                val text =
-                    (source.text?.toString() ?: source.contentDescription?.toString())
-                        .orEmpty()
-                        .trim()
-                        .lowercase()
-
-                if (
-                    id.contains("send") ||
-                    id.contains("btn_send") ||
-                    text == "å‘é€" ||
-                    text == "send" ||
-                    text.contains("å‘é€æ¶ˆæ¯")
-                ) {
-                    return true
-                }
-            } finally {
-                source.recycle()
-            }
-        }
-
-        val eventText = event.text.joinToString(" ").trim().lowercase()
-        val description = event.contentDescription?.toString().orEmpty().trim().lowercase()
-        return eventText == "å‘é€" ||
-            eventText.contains("å‘é€æ¶ˆæ¯") ||
-            description == "å‘é€" ||
-            description.contains("å‘é€æ¶ˆæ¯")
-    }
-
-    private fun logEvent(pkg: String, event: AccessibilityEvent) {
-        val source = event.source
-        try {
-            DiagnosticLog.add(
-                "APP-EVENT",
-                buildString {
-                    append("pkg=$pkg type=${eventName(event.eventType)}")
-                    append(" win=${event.windowId}")
-                    append(" from=${event.fromIndex}")
-                    append(" add=${event.addedCount}")
-                    append(" remove=${event.removedCount}")
-                    append(" beforeLen=${event.beforeText?.length ?: -1}")
-                    append(" eventTextCount=${event.text.size}")
-                    append(" eventTextLen=${event.text.firstOrNull()?.length ?: -1}")
-                    append(" source=")
-                    append(if (source == null) "null" else nodeSummary(source))
-                }
-            )
-        } finally {
-            source?.recycle()
-        }
-    }
-
-    private fun nodeSummary(node: AccessibilityNodeInfo): String {
-        val bounds = Rect()
-        node.getBoundsInScreen(bounds)
-        return buildString {
-            append("class=${node.className?.toString().orEmpty()}")
-            append(" id=${node.viewIdResourceName.orEmpty()}")
-            append(" editable=${node.isEditable}")
-            append(" focusable=${node.isFocusable}")
-            append(" focused=${node.isFocused}")
-            append(" enabled=${node.isEnabled}")
-            append(" visible=${node.isVisibleToUser}")
-            append(" textLen=${node.text?.length ?: -1}")
-            append(" sel=${node.textSelectionStart}..${node.textSelectionEnd}")
-            append(" bounds=${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}")
-            append(" actions=${node.actionList.joinToString(",") { it.id.toString() }}")
-        }
-    }
-
-    private fun eventName(type: Int): String = when (type) {
-        AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> "TEXT_CHANGED"
-        AccessibilityEvent.TYPE_VIEW_FOCUSED -> "VIEW_FOCUSED"
-        AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> "SELECTION_CHANGED"
-        AccessibilityEvent.TYPE_VIEW_CLICKED -> "VIEW_CLICKED"
-        AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> "WINDOW_STATE_CHANGED"
-        AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> "WINDOW_CONTENT_CHANGED"
-        AccessibilityEvent.TYPE_WINDOWS_CHANGED -> "WINDOWS_CHANGED"
-        else -> "EVENT_$type"
-    }
-
-    private fun reloadRules() {
-        cachedRules = repository.loadRules()
-        DiagnosticLog.add("RULE", "universal reloaded count=${cachedRules.size}")
-    }
-
-    private fun reloadSettings() {
-        val settings = AppSettings(this)
-        compatibilityScanEnabled = settings.compatibilityScanEnabled
-        lockReplacementEnabled = settings.lockReplacementEnabled
-        DiagnosticLog.add(
-            "SETTINGS",
-            "universal scan=$compatibilityScanEnabled lock=$lockReplacementEnabled"
-        )
-
-        if (!lockReplacementEnabled) {
-            nodeSession?.clearLock()
-            imeSession?.clearLock()
-        }
-    }
-
-    private fun scheduleScan(delayMs: Long) {
-        handler.removeCallbacks(delayedScanRunnable)
-        handler.postDelayed(delayedScanRunnable, delayMs)
-    }
-
-    override fun onInterrupt() {
-        ServiceRuntimeState.markError("ç³»ç»Ÿè°ƒç”¨äº† onInterrupt")
-        DiagnosticLog.add("SERVICE", "universal onInterrupt")
-    }
-
-    override fun onUnbind(intent: android.content.Intent?): Boolean {
-        cleanup("æ— éšœç¢æœåŠ¡å·²è§£ç»‘")
-        return super.onUnbind(intent)
-    }
-
-    override fun onDestroy() {
-        cleanup("æ— éšœç¢æœåŠ¡å·²é”€æ¯")
-        super.onDestroy()
-    }
-
-    private fun cleanup(reason: String) {
-        handler.removeCallbacks(heartbeatRunnable)
-        handler.removeCallbacks(delayedScanRunnable)
-
-        if (listenerRegistered) {
-            prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
-            listenerRegistered = false
-        }
-
-        nodeSession = null
-        imeSession = null
-        ServiceRuntimeState.markDisconnected(reason)
-        DiagnosticLog.add("SERVICE", "universal $reason")
-    }
-
-    private data class DerivedText(
-        val text: String,
-        val confident: Boolean,
-        val mode: String,
-        val rawLength: Int,
-    )
-
-    private data class NodeKey(
-        val windowId: Int,
-        val packageName: String,
-        val viewId: String,
-        val className: String,
-        val bounds: String,
-    )
-
-    private data class InputSession(
-        val key: NodeKey,
-        var lastWritten: String = "",
-        var lastWriteAt: Long = 0L,
-        var lockActive: Boolean = false,
-        var lockedText: String = "",
-        var allowClearUntil: Long = 0L,
-        var compositionUntil: Long = 0L,
-        var compositionPending: Boolean = false,
-    ) {
-        fun clearLock() {
-            lockActive = false
-            lockedText = ""
-        }
-
-        fun unlockForSend() {
-            allowClearUntil = System.currentTimeMillis() + SEND_CLEAR_GRACE_MS
-            compositionUntil = 0L
-            compositionPending = false
-            clearLock()
-        }
-    }
-
-    private companion object {
-        const val TAG = "TypingReplacerUniversal"
-        const val SELF_WRITE_GUARD_MS = 1200L
-        const val COMPATIBILITY_SCAN_INTERVAL_MS = 900L
-        const val SEND_CLEAR_GRACE_MS = 1800L
-        const val CONTENT_SCAN_THROTTLE_MS = 400L
-        const val CONTENT_SCAN_DELAY_MS = 120L
-        const val TEXT_FALLBACK_SCAN_DELAY_MS = 70L
-        const val FOCUS_SCAN_DELAY_MS = 80L
-        const val CLICK_SCAN_DELAY_MS = 100L
-        const val WINDOW_SCAN_DELAY_MS = 140L
-        const val MAX_TREE_DEPTH = 8
-        const val MIN_EDITABLE_CANDIDATE_SCORE = 80
-        const val IME_SYNTHETIC_WINDOW_ID = -2000
-
-        const val COMPOSITION_GRACE_MS = 1200L
-        const val COMPOSING_LARGE_EDIT_MIN = 8
-        const val MAX_MANUAL_LOCK_DELETE_CHARS = 8
-    }
-}
+        ServiceRuntimeState.markNode("InputConnection å†™å…¥æ”åŠŸèƒ½ï¼š	Ùûï"	™X\ÛÛ»ï"HŠBˆ™]\›ˆYBˆB‚ˆš]˜]H[ˆ›ØÙ\ÜÓ›ÙJˆ›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›Ëˆ]™[ˆXØÙ\ÜÚXš[]Q]™[Ëˆ™X\ÛÛˆİš[™Ëˆ
+Nˆ›ÛÛX[ˆÂˆYˆ
+Z\ÑY]X›U\™Ù]
+›ÙJJH™]\›ˆ˜[ÙBˆ˜[ÙÈH›ÙKœXÚØYÙS˜[YOËÔİš[™Ê
+K›Ü‘[\J
+BˆYˆ
+ÙËš\Ğ›[šÊ
+HÙÈOHXÚØYÙS˜[YJH™]\›ˆ˜[ÙB‚ˆ˜[İ\œ™[H›ÙK^ËÔİš[™Ê
+HÎˆˆ‚ˆ˜[Ù^HH›ÙRÙ^J›ÙJBˆ˜[›İÈHŞ\İ[K˜İ\œ™[[YSZ[\Ê
+Bˆ˜[Xİ]™TÙ\ÜÚ[ÛˆH›ÙTÙ\ÜÚ[ÛËZÙRYˆÈ]šÙ^HOHÙ^HBˆÎˆ[œ]Ù\ÜÚ[ÛŠÙ^JK˜[ÛÈÈ›ÙTÙ\ÜÚ[ÛˆH]B‚ˆYˆ
+ˆ›İÈHXİ]™TÙ\ÜÚ[Û‹›\İÜš]P]HÑS—ÕÔ’UWÑÕPT‘ÓTÈ	‰‚ˆİ\œ™[OHXİ]™TÙ\ÜÚ[Û‹›\İÜš][‚ˆ
+H™]\›ˆYB‚ˆ˜[ÛÛ\ÜÚ[™ÈH\]PÛÛ\ÜÚ][Û”İ]JÙË]™[Xİ]™TÙ\ÜÚ[ÛŠBˆYˆ
+ÛÛ\ÜÚ[™ÊHÂˆXYÛ›ÜİXÓÙË˜Y
+ˆTPÓÓTÔÑH‹ˆ™Y™\‹]˜[œÙ›Ü›HÙÏIÙÈ[IØİ\œ™[›[™İH[™[™ÏIØXİ]™TÙ\ÜÚ[Û‹˜ÛÛ\ÜÚ][Û”[™[™ßH][›ÙH‹ˆ
+Bˆ™]\›ˆYBˆB‚ˆ˜[Ù][™ĞÛÛ\ÜÚ][ÛˆHXİ]™TÙ\ÜÚ[Û‹˜ÛÛ\ÜÚ][Û”[™[™ÂˆYˆ
+Ù][™ĞÛÛ\ÜÚ][ÛŠHÂˆXİ]™TÙ\ÜÚ[Û‹˜ÛÛ\ÜÚ][Û”[™[™ÈH˜[ÙBˆXYÛ›ÜİXÓÙË˜Y
+ˆTPÓÓTÔÑH‹ˆœÙ]YÙÏIÙÈ[IØİ\œ™[›[™İNÈ[\\ÜÈ][›ÙH‹ˆ
+BˆB‚ˆYˆ
+İ\œ™[š\Ñ[\J
+JHÂˆYˆ
+Úİ[™\İÜ™SØÚÙY[][ÛŠ]™[İ\œ™[Xİ]™TÙ\ÜÚ[Û‹›İË˜[ÙJJHÂˆ˜[™\İÜ™HHXİ]™TÙ\ÜÚ[Û‹›ØÚÙY^šY‘[\HÈXİ]™TÙ\ÜÚ[Û‹›\İÜš][ˆBˆ™]\›ˆÜš]S›ÙSÜ’[YJˆ›ÙKÙËİ\œ™[™\İÜ™K›ØÚË\™\İÜ™KY[\H‹Xİ]™TÙ\ÜÚ[Û‹ˆ
+BˆBˆXİ]™TÙ\ÜÚ[Û‹›\İÜš][ˆHˆ‚ˆXİ]™TÙ\ÜÚ[Û‹˜ÛX\“ØÚÊ
+Bˆ™]\›ˆYBˆB‚ˆYˆ
+Úİ[™\İÜ™SØÚÙY[][ÛŠ]™[İ\œ™[Xİ]™TÙ\ÜÚ[Û‹›İË˜[ÙJJHÂˆ˜[™\İÜ™HHXİ]™TÙ\ÜÚ[Û‹›ØÚÙY^šY‘[\HÈXİ]™TÙ\ÜÚ[Û‹›\İÜš][ˆBˆXYÛ›ÜİXÓÙË˜Y
+ˆTSĞÒÈ‹ˆœ™\İÜ™KY[]K[›ÙHÙÏIÙÈİ\œ™[[IØİ\œ™[›[™İH\İ[IØXİ]™TÙ\ÜÚ[Û‹›\İÜš][‹›[™İH™\İÜ™S[IÜ™\İÜ™K›[™İH‹ˆ
+Bˆ™]\›ˆÜš]S›ÙSÜ’[YJˆ›ÙKˆÙËˆİ\œ™[ˆ™\İÜ™Kˆ›ÙK^Ù[Xİ[Û‘[™ˆİ\œ™[›[™İˆ›ØÚË\™\İÜ™KY[]H‹ˆXİ]™TÙ\ÜÚ[Û‹ˆ
+BˆB‚ˆ˜[Ú[™ÙHHYˆ
+]™[OH[
+H[[ÙH[˜Ü™[Y[[˜[œÙ›Ü›Y\‹Ú[™ÙJˆ™Y›Ü™U^H]™[˜™Y›Ü™U^ËÔİš[™Ê
+Kˆœ›ÛR[™^H]™[™œ›ÛR[™^ˆYYÛİ[H]™[˜YYÛİ[ˆ™[[İ™YÛİ[H]™[œ™[[İ™YÛİ[ˆ
+B‚ˆ˜[\™Ù]HYˆ
+Ù][™ĞÛÛ\ÜÚ][ÛŠHÂˆ[˜Ü™[Y[[˜[œÙ›Ü›Y\‹˜[œÙ›Ü›Jİ\œ™[Xİ]™TÙ\ÜÚ[Û‹›\İÜš][‹[ØXÚY[\ÊBˆH[ÙHÂˆ[˜Ü™[Y[[˜[œÙ›Ü›Y\‹˜[œÙ›Ü›Jİ\œ™[Xİ]™TÙ\ÜÚ[Û‹›\İÜš][‹Ú[™ÙKØXÚY[\ÊBˆBˆ˜[]H\™Ù]OHİ\œ™[ˆXYÛ›ÜİXÓÙË˜Y
+ˆTUS”Ñ“Ô“H‹ˆœÙÏIÙÈ™\XÙ[Y[I]İ\œ™[[IØİ\œ™[›[™İH\™Ù][Iİ\™Ù]›[™İHÛÛ\ÜÚ[™ÏY˜[ÙHÙ]OIÙ][™ĞÛÛ\ÜÚ][Ûˆ][›ÙH‹ˆ
+B‚ˆYˆ
+Z]
+HÂˆXİ]™TÙ\ÜÚ[Û‹›\İÜš][ˆHİ\œ™[ˆYˆ
+ØÚÔ™\XÙ[Y[[˜X›Y	‰ˆXİ]™TÙ\ÜÚ[Û‹›ØÚĞXİ]™JHÂˆXİ]™TÙ\ÜÚ[Û‹›ØÚÙY^Hİ\œ™[ˆBˆ™]\›ˆYBˆB‚ˆ˜[ÚÈHÜš]S›ÙSÜ’[YJˆ›ÙKˆÙËˆİ\œ™[ˆ\™Ù]ˆ›ÙK^Ù[Xİ[Û‘[™ˆİ\œ™[›[™İˆ™X\ÛÛ‹ˆXİ]™TÙ\ÜÚ[Û‹ˆ
+BˆYˆ
+ÚÈ	‰ˆØÚÔ™\XÙ[Y[[˜X›Y
+HÂˆXİ]™TÙ\ÜÚ[Û‹›ØÚĞXİ]™HHYBˆXİ]™TÙ\ÜÚ[Û‹›ØÚÙY^H\™Ù]ˆXYÛ›ÜİXÓÙË˜Y
+TSĞÒÈ‹˜\›YYÙÏIÙÈ[Iİ\™Ù]›[™İH][›ÙHŠBˆBˆ™]\›ˆÚÂˆB‚ˆš]˜]H[ˆ\]PÛÛ\ÜÚ][Û”İ]JˆÙÎˆİš[™Ëˆ]™[ˆXØÙ\ÜÚXš[]Q]™[ËˆXİ]™TÙ\ÜÚ[Ûˆ[œ]Ù\ÜÚ[Û‹ˆ
+Nˆ›ÛÛX[ˆÂˆ˜[›İÈHŞ\İ[K˜İ\œ™[[YSZ[\Ê
+BˆYˆ
+]™[OH[
+H™]\›ˆ›İÈXİ]™TÙ\ÜÚ[Û‹˜ÛÛ\ÜÚ][Û•[[‚ˆ˜[YYH]™[˜YYÛİ[ˆ˜[™[[İ™YH]™[œ™[[İ™YÛİ[ˆ˜[œ›ÛHH]™[™œ›ÛR[™^ˆ˜[™Y›Ü™S[ˆH]™[˜™Y›Ü™U^Ë›[™İÎˆXİ]™TÙ\ÜÚ[Û‹›\İÜš][‹›[™İˆ˜[[™XYPÛÛ\ÜÚ[™ÈH›İÈXİ]™TÙ\ÜÚ[Û‹˜ÛÛ\ÜÚ][Û•[[‚ˆ˜[™\XÙR[”XÙHHYYˆ	‰ˆ™[[İ™Yˆˆ˜[˜]Ú\[™HYYHSQWĞUÒĞQÓRSˆ	‰ˆ™[[İ™YOHˆ˜[[ÛX\ˆBˆ[™XYPÛÛ\ÜÚ[™È	‰‚ˆYYOH	‰ˆ™[[İ™Yˆ	‰ˆœ›ÛHOH	‰ˆ™Y›Ü™S[ˆˆ	‰ˆ™[[İ™YH™Y›Ü™S[‚ˆ˜[\™ÙQ[]HBˆ[™XYPÛÛ\ÜÚ[™È	‰‚ˆYYOH	‰ˆ™[[İ™YHSQWĞUÒÔ‘SSÕ‘WÓRSˆ	‰ˆ™Y›Ü™S[ˆˆ	‰‚ˆ
+œ›ÛHOH™[[İ™Y
+ˆÈH™Y›Ü™S[ŠBˆ˜[XY™]Üš]HHœ›ÛHOH	‰ˆ™[[İ™Yˆ	‰ˆYYHSQWĞUÒĞQÓRS‚‚ˆYˆ
+™\XÙR[”XÙH˜]Ú\[™[ÛX\ˆ\™ÙQ[]HXY™]Üš]JHÂˆXİ]™TÙ\ÜÚ[Û‹˜ÛÛ\ÜÚ][Û•[[H›İÈ
+ÈSQWĞÓÓTÔÒS‘×ÔÑUWÓTÂˆXİ]™TÙ\ÜÚ[Û‹˜ÛÛ\ÜÚ][Û”[™[™ÈHYB‚ˆ˜[ÛÛ\ÜÙT™X\ÛÛˆHÚ[ˆÂˆ[ÛX\ˆOˆ™[XÛX\ˆ‚ˆ\™ÙQ[]HOˆ›\™ÙKY[]H‚ˆXY™]Üš]HOˆšXY\™]Üš]H‚ˆ™\XÙR[”XÙHOˆœ™\XÙKZ[‹\XÙH‚ˆ[ÙHOˆ˜˜]ÚX\[™‚ˆB‚ˆ˜[\İXİ]™T™]Üš]HH™\XÙR[”XÙH[ÛX\ˆ\™ÙQ[]HXY™]Üš]BˆYˆ
+\İXİ]™T™]Üš]H	‰ˆXİ]™TÙ\ÜÚ[Û‹›ØÚĞXİ]™JHÂˆXİ]™TÙ\ÜÚ[Û‹˜ÛX\“ØÚÊ
+BˆXYÛ›ÜİXÓÙË˜Y
+ˆTPÓÓTÔÑH‹ˆ›ØÚË\İ\Ü[™YÙÏIÙÈ™X\ÛÛIÛÛ\ÜÙT™X\ÛÛˆYIYY™[[İ™OI™[[İ™Yœ›ÛOIœ›ÛH™Y›Ü™S[I™Y›Ü™S[ˆ‹ˆ
+BˆH[ÙHYˆ
+X[™XYPÛÛ\ÜÚ[™ÊHÂˆXYÛ›ÜİXÓÙË˜Y
+ˆTPÓÓTÔÑH‹ˆ™]XİYÙÏIÙÈ™X\ÛÛIÛÛ\ÜÙT™X\ÛÛˆYIYY™[[İ™OI™[[İ™Yœ›ÛOIœ›ÛH™Y›Ü™S[I™Y›Ü™S[ˆ‹ˆ
+BˆBˆ™]\›ˆYBˆB‚ˆ™]\›ˆ›İÈXİ]™TÙ\ÜÚ[Û‹˜ÛÛ\ÜÚ][Û•[[ˆB‚ˆš]˜]H[ˆÚİ[™\İÜ™SØÚÙY[][ÛŠˆ]™[ˆXØÙ\ÜÚXš[]Q]™[Ëˆİ\œ™[ˆİš[™ËˆXİ]™TÙ\ÜÚ[Ûˆ[œ]Ù\ÜÚ[Û‹ˆ›İÎˆÛ™ËˆÛÛ\ÜÚ[™Îˆ›ÛÛX[‹ˆ
+Nˆ›ÛÛX[ˆÂˆYˆ
+[ØÚÔ™\XÙ[Y[[˜X›YXXİ]™TÙ\ÜÚ[Û‹›ØÚĞXİ]™JH™]\›ˆ˜[ÙBˆYˆ
+]™[OH[ÛÛ\ÜÚ[™ÊH™]\›ˆ˜[ÙBˆYˆ
+›İÈHXİ]™TÙ\ÜÚ[Û‹˜[İĞÛX\•[[
+H™]\›ˆ˜[ÙBˆYˆ
+]™[˜YYÛİ[OH]™[œ™[[İ™YÛİ[H
+H™]\›ˆ˜[ÙB‚ˆ˜[™Y›Ü™S[ˆH]™[˜™Y›Ü™U^Ë›[™İÎˆXİ]™TÙ\ÜÚ[Û‹›\İÜš][‹›[™İˆYˆ
+™Y›Ü™S[ˆHİ\œ™[›[™İH™Y›Ü™S[ŠH™]\›ˆ˜[ÙB‚ˆ˜[ÚÛQšY[[]HH]™[™œ›ÛR[™^OH	‰ˆ]™[œ™[[İ™YÛİ[H™Y›Ü™S[‚ˆYˆ
+ÚÛQšY[[]JH™]\›ˆYBˆ™]\›ˆ]™[œ™[[İ™YÛİ[HPVÓPS•PSÓĞÒ×ÑSUWĞÒT”ÂˆB‚ˆš]˜]H[ˆÜš]S›ÙSÜ’[YJˆ›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›ËˆÙÎˆİš[™Ëˆİ\œ™[ˆİš[™Ëˆ\™Ù]ˆİš[™ËˆÛÙ[Xİ[Û‘[™ˆ[ˆÛ[™İˆ[ˆ™X\ÛÛˆİš[™ËˆXİ]™TÙ\ÜÚ[Ûˆ[œ]Ù\ÜÚ[Û‹ˆ
+Nˆ›ÛÛX[ˆÂˆ˜[›Øİ\ÓÚÈH›ÙKœ\™›Ü›PXİ[ÛŠXØÙ\ÜÚXš[]S›ÙR[™›ËPÕSÓ—Ñ“ĞÕTÊBˆ˜[\™ÜÈH[™J
+K˜\HÂˆ]Ú\”Ù\]Y[˜ÙJXØÙ\ÜÚXš[]S›ÙR[™›ËPÕSÓ—ĞT‘ÕSQS•ÔÑUÕVĞÒT”ÑTUQSÑK\™Ù]
+BˆBˆ˜[Ù]^ÚÈH›ÙKœ\™›Ü›PXİ[ÛŠXØÙ\ÜÚXš[]S›ÙR[™›ËPÕSÓ—ÔÑUÕV\™ÜÊBˆXYÛ›ÜİXÓÙË˜Y
+ˆTS“ÑKUÔ’UH‹ˆœÙÏIÙÈ™X\ÛÛI™X\ÛÛˆ›Øİ\ÏI›Øİ\ÓÚÈÙ]^IÙ]^ÚÈİ\œ™[[IØİ\œ™[›[™İH\™Ù][Iİ\™Ù]›[™İH‹ˆ
+B‚ˆYˆ
+Ù]^ÚÊHÂˆ™\İÜ™TÙ[Xİ[ÛŠ›ÙK\™Ù]ÛÙ[Xİ[Û‘[™Û[™İ
+BˆXİ]™TÙ\ÜÚ[Û‹›\İÜš][ˆH\™Ù]ˆXİ]™TÙ\ÜÚ[Û‹›\İÜš]P]HŞ\İ[K˜İ\œ™[[YSZ[\Ê
+BˆYˆ
+Xİ]™TÙ\ÜÚ[Û‹›ØÚĞXİ]™JHXİ]™TÙ\ÜÚ[Û‹›ØÚÙY^H\™Ù]ˆÙ\šXÙT[[YTİ]K›X\šÔ™\XÙ[Y[
+ÙÊBˆÙ\šXÙT[[YTİ]K›X\šÓ›ÙJXØÙ\ÜÚXš[]S›ÙH9a¦yaiyi,z-){ï&‰ÙÈ;ï"	™X\ÛÛ»ï"HŠBˆ™]\›ˆYBˆB‚ˆYˆ
+Z[•‘T”ÒSÓ‹”Ñ×ÒS•HÌÊHÂˆ˜[[YPXİ]™HHÙ][YTÙ\ÜÚ[ÛŠÙË›ÙKÚ[™İÒY
+Bˆ˜[ÚÈHÜš]R[YJÙËİ\œ™[\™Ù]‰™X\ÛÛ‹[›ÙKY˜[˜XÚÈ‹[YPXİ]™JBˆYˆ
+ÚÊHÂˆXİ]™TÙ\ÜÚ[Û‹›\İÜš][ˆH\™Ù]ˆXİ]™TÙ\ÜÚ[Û‹›\İÜš]P]HŞ\İ[K˜İ\œ™[[YSZ[\Ê
+BˆYˆ
+Xİ]™TÙ\ÜÚ[Û‹›ØÚĞXİ]™JHXİ]™TÙ\ÜÚ[Û‹›ØÚÙY^H\™Ù]ˆ™]\›ˆYBˆBˆB‚ˆÙ\šXÙT[[YTİ]K›X\šÑ\œ›ÜŠº" ¹à®yd£[œ]ÛÛ›™Xİ[Ûˆ9gaù¥è9¬åya¦yai{ï&‰ÙÈŠBˆ™]\›ˆ˜[ÙBˆB‚ˆš]˜]H[ˆ[œÜXİİ\œ™[Y]ÜŠ™X\ÛÛˆİš[™ÊHÂˆ˜[›ÙHHš[™›Øİ\ÙYY]X›J
+BˆYˆ
+›ÙHOH[
+HÂˆHÂˆYˆ
+›ØÙ\ÜÓ›ÙJ›ÙK[™X\ÛÛŠJH™]\›‚ˆHš[˜[HÂˆ›ÙKœ™XŞXÛJ
+BˆBˆB‚ˆYˆ
+Z[•‘T”ÒSÓ‹”Ñ×ÒS•HÌÈ	‰ˆ›ØÙ\ÜÒ[YTÛ˜\Úİ
+[‰™X\ÛÛ‹Z[YHŠJH™]\›‚ˆÙ\šXÙT[[YTİ]K›X\šÓ›ÙJ¹§*¹¢o¹b,9cëùå*:/¤ùaiyï%º/¤yfj	™X\ÛÛŠIŠBˆB‚ˆš]˜]H[ˆš[™›Øİ\ÙYY]X›J
+NˆXØÙ\ÜÚXš[]S›ÙR[™›ÏÈÂˆ˜[Xİ]™T›ÛİH›Ûİ[Xİ]™UÚ[™İÂˆYˆ
+Xİ]™T›ÛİOH[
+HÂˆHÂˆ˜[›Øİ\ÙYHXİ]™T›Ûİ™š[™›Øİ\ÊXØÙ\ÜÚXš[]S›ÙR[™›Ë‘“ĞÕT×ÒS”U
+BˆYˆ
+›Øİ\ÙYOH[
+HÂˆYˆ
+\ÑY]X›U\™Ù]
+›Øİ\ÙY
+JH™]\›ˆ›Øİ\ÙYˆ›Øİ\ÙYœ™XŞXÛJ
+BˆBˆš[™Y\›Øİ\ÙYY]X›JXİ]™T›Ûİ
+OË›]È™]\›ˆ]Bˆš[™™\İY]X›PØ[™Y]JXİ]™T›Ûİ
+OË›]È™]\›ˆ]BˆHš[˜[HÂˆXİ]™T›Ûİœ™XŞXÛJ
+BˆBˆB‚ˆ˜[Ü™\™YÚ[™İÜÈHÚ[™İÜËœÛÜYÚ]
+ˆÛÛ\\™PQ\ØÙ[™[™ÏXØÙ\ÜÚXš[]UÚ[™İÒ[™›ÏˆÈ]š\Ñ›Øİ\ÙYBˆ[Q\ØÙ[™[™ÈÈ]š\ĞXİ]™HKˆ
+Bˆ›Üˆ
+Ú[™İÈ[ˆÜ™\™YÚ[™İÜÊHÂˆ˜[›ÛİHÚ[™İËœ›ÛİÎˆÛÛ[YBˆHÂˆ˜[›Øİ\ÙYH›Ûİ™š[™›Øİ\ÊXØÙ\ÜÚXš[]S›ÙR[™›Ë‘“ĞÕT×ÒS”U
+BˆYˆ
+›Øİ\ÙYOH[
+HÂˆYˆ
+\ÑY]X›U\™Ù]
+›Øİ\ÙY
+JH™]\›ˆ›Øİ\ÙYˆ›Øİ\ÙYœ™XŞXÛJ
+BˆBˆš[™Y\›Øİ\ÙYY]X›J›Ûİ
+OË›]È™]\›ˆ]Bˆš[™™\İY]X›PØ[™Y]J›Ûİ
+OË›]È™]\›ˆ]BˆHš[˜[HÂˆ›Ûİœ™XŞXÛJ
+BˆBˆBˆ™]\›ˆ[ˆB‚ˆš]˜]H[ˆš[™Y\›Øİ\ÙYY]X›J›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›ÊNˆXØÙ\ÜÚXš[]S›ÙR[™›ÏÈÂˆYˆ
+
+›ÙKš\Ñ›Øİ\ÙY›ÙKš\ĞXØÙ\ÜÚXš[]Q›Øİ\ÙY
+H	‰ˆ\ÑY]X›U\™Ù]
+›ÙJJHÂˆ™]\›ˆXØÙ\ÜÚXš[]S›ÙR[™›Ë›ØZ[Š›ÙJBˆBˆ›Üˆ
+H[ˆ[[›ÙK˜Ú[Ûİ[
+HÂˆ˜[Ú[H›ÙK™Ù]Ú[
+JHÎˆÛÛ[YBˆHÂˆ˜[›İ[™Hš[™Y\›Øİ\ÙYY]X›JÚ[
+BˆYˆ
+›İ[™OH[
+H™]\›ˆ›İ[™ˆHš[˜[HÂˆÚ[œ™XŞXÛJ
+BˆBˆBˆ™]\›ˆ[ˆB‚ˆš]˜]H[ˆš[™™\İY]X›PØ[™Y]J›ÛİˆXØÙ\ÜÚXš[]S›ÙR[™›ÊNˆXØÙ\ÜÚXš[]S›ÙR[™›ÏÈÂˆ˜\ˆ™\İˆXØÙ\ÜÚXš[]S›ÙR[™›ÏÈH[ˆ˜\ˆ™\İØÛÜ™HH‚ˆ[ˆš\Ú]
+›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›Ë\ˆ[
+HÂˆYˆ
+\ˆPVÕ‘QWÑT
+H™]\›‚ˆ˜[ØÛÜ™HHY]X›PØ[™Y]TØÛÜ™J›ÙJBˆYˆ
+ØÛÜ™Hˆ™\İØÛÜ™JHÂˆ™\İËœ™XŞXÛJ
+Bˆ™\İHXØÙ\ÜÚXš[]S›ÙR[™›Ë›ØZ[Š›ÙJBˆ™\İØÛÜ™HHØÛÜ™BˆBˆ›Üˆ
+H[ˆ[[›ÙK˜Ú[Ûİ[
+HÂˆ˜[Ú[H›ÙK™Ù]Ú[
+JHÎˆÛÛ[YBˆHÂˆš\Ú]
+Ú[\
+ÈJBˆHš[˜[HÂˆÚ[œ™XŞXÛJ
+BˆBˆBˆB‚ˆš\Ú]
+›Ûİ
+Bˆ™]\›ˆYˆ
+™\İØÛÜ™HHRS—ÑQUP“WĞĞS‘QUWÔĞÓÔ‘JH™\İ[ÙHÂˆ™\İËœ™XŞXÛJ
+Bˆ[ˆBˆB‚ˆš]˜]H[ˆY]X›PØ[™Y]TØÛÜ™J›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›ÊNˆ[ÂˆYˆ
+›ÙKœXÚØYÙS˜[YOËÔİš[™Ê
+HOHXÚØYÙS˜[YJH™]\›ˆˆ˜\ˆØÛÜ™HHˆYˆ
+›ÙKš\ÑY]X›JHØÛÜ™H
+ÏHLˆYˆ
+›ÙK˜Xİ[Û“\İ˜[HÈ]šYOHXØÙ\ÜÚXš[]S›ÙR[™›ËPÕSÓ—ÔÑUÕVJHØÛÜ™H
+ÏHLˆYˆ
+›ÙK˜Û\ÜÓ˜[YOËÔİš[™Ê
+OË˜ÛÛZ[œÊ‘Y]^‹YÛ›Ü™PØ\ÙHHYJHOHYJHØÛÜ™H
+ÏHˆYˆ
+›ÙKš\Ñ›Øİ\ÙY
+HØÛÜ™H
+ÏHLˆYˆ
+›ÙKš\ĞXØÙ\ÜÚXš[]Q›Øİ\ÙY
+HØÛÜ™H
+ÏHÌˆYˆ
+›ÙKš\Ñ›Øİ\ØX›JHØÛÜ™H
+ÏHŒˆYˆ
+›ÙKš\Ñ[˜X›Y
+HØÛÜ™H
+ÏHLˆYˆ
+›ÙKš\Õš\ÚX›UÕ\Ù\ŠHØÛÜ™H
+ÏHLˆYˆ
+›ÙK^Ù[Xİ[Û”İ\H›ÙK^Ù[Xİ[Û‘[™H
+HØÛÜ™H
+ÏHŒˆ™]\›ˆØÛÜ™BˆB‚ˆš]˜]H[ˆ\ÑY]X›U\™Ù]
+›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›ÊNˆ›ÛÛX[ˆÂˆYˆ
+[›ÙKš\Ñ[˜X›Y›ÙKš\Ô\ÜİÛÜ™
+H™]\›ˆ˜[ÙBˆYˆ
+›ÙKš\ÑY]X›JH™]\›ˆYBˆYˆ
+›ÙK˜Xİ[Û“\İ˜[HÈ]šYOHXØÙ\ÜÚXš[]S›ÙR[™›ËPÕSÓ—ÔÑUÕVJH™]\›ˆYBˆ™]\›ˆ›ÙK˜Û\ÜÓ˜[YOËÔİš[™Ê
+OË˜ÛÛZ[œÊ‘Y]^‹YÛ›Ü™PØ\ÙHHYJHOHYH	‰ˆ›ÙKš\Ñ›Øİ\ØX›BˆB‚ˆš]˜]H[ˆ›ÙRÙ^J›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›ÊNˆ›ÙRÙ^HÂˆ˜[›İ[™ÈH™Xİ
+
+Bˆ›ÙK™Ù]›İ[™Ò[”ØÜ™Y[Š›İ[™ÊBˆ™]\›ˆ›ÙRÙ^JˆÚ[™İÒYH›ÙKÚ[™İÒYˆXÚØYÙS˜[YHH›ÙKœXÚØYÙS˜[YOËÔİš[™Ê
+K›Ü‘[\J
+KˆšY]ÒYH›ÙKšY]ÒY™\Ûİ\˜ÙS˜[YK›Ü‘[\J
+KˆÛ\ÜÓ˜[YHH›ÙK˜Û\ÜÓ˜[YOËÔİš[™Ê
+K›Ü‘[\J
+Kˆ›İ[™ÈH‰Ø›İ[™Ë›YK	Ø›İ[™ËÜK	Ø›İ[™ËœšYÚK	Ø›İ[™Ë˜›İÛ_H‹ˆ
+BˆB‚ˆš]˜]H[ˆÙ][YTÙ\ÜÚ[ÛŠÙÎˆİš[™ËÚ[™İÒYˆ[
+Nˆ[œ]Ù\ÜÚ[ÛˆÂˆ˜[İ\œ™[H[YTÙ\ÜÚ[Û‚ˆYˆ
+İ\œ™[OH[	‰ˆİ\œ™[šÙ^KœXÚØYÙS˜[YHOHÙÊH™]\›ˆİ\œ™[‚ˆ[™\‹œ™[[İ™PØ[˜XÚÜÊ[YTÙ]T[›˜X›JBˆ˜[Ù^HH›ÙRÙ^JˆÚ[™İÒYHÚ[™İÒYˆXÚØYÙS˜[YHHÙËˆšY]ÒYHXØÙ\ÜÚXš[]KZ[YH‹ˆÛ\ÜÓ˜[YHH’[œ]ÛÛ›™Xİ[Ûˆ‹ˆ›İ[™ÈHˆ‹ˆ
+Bˆ™]\›ˆ[œ]Ù\ÜÚ[ÛŠÙ^JK˜[ÛÈÈ[YTÙ\ÜÚ[ÛˆH]BˆB‚ˆš]˜]H[ˆ™\İÜ™TÙ[Xİ[ÛŠˆ›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›Ëˆ^ˆİš[™ËˆÛÙ[Xİ[Û‘[™ˆ[ˆÛ[™İˆ[ˆ
+HÂˆYˆ
+ÛÙ[Xİ[Û‘[™
+H™]\›‚ˆ˜[[HH^›[™İHÛ[™İˆ˜[™]ÔÙ[Xİ[ÛˆH
+ÛÙ[Xİ[Û‘[™
+È[JK˜ÛÙ\˜ÙR[Š^›[™İ
+Bˆ˜[\™ÜÈH[™J
+K˜\HÂˆ][
+XØÙ\ÜÚXš[]S›ÙR[™›ËPÕSÓ—ĞT‘ÕSQS•ÔÑSPÕSÓ—ÔÕT•ÒS•™]ÔÙ[Xİ[ÛŠBˆ][
+XØÙ\ÜÚXš[]S›ÙR[™›ËPÕSÓ—ĞT‘ÕSQS•ÔÑSPÕSÓ—ÑS‘ÒS•™]ÔÙ[Xİ[ÛŠBˆBˆ›ÙKœ\™›Ü›PXİ[ÛŠXØÙ\ÜÚXš[]S›ÙR[™›ËPÕSÓ—ÔÑUÔÑSPÕSÓ‹\™ÜÊBˆB‚ˆš]˜]H[ˆ\ÓZÙ[TÙ[™]™[
+]™[ˆXØÙ\ÜÚXš[]Q]™[
+Nˆ›ÛÛX[ˆÂˆ˜[Ûİ\˜ÙHH]™[œÛİ\˜ÙBˆYˆ
+Ûİ\˜ÙHOH[
+HÂˆHÂˆ˜[YHÛİ\˜ÙKšY]ÒY™\Ûİ\˜ÙS˜[YOË›İÙ\˜Ø\ÙJ
+K›Ü‘[\J
+Bˆ˜[^H
+Ûİ\˜ÙK^ËÔİš[™Ê
+HÎˆÛİ\˜ÙK˜ÛÛ[\ØÜš\[ÛËÔİš[™Ê
+JBˆ›Ü‘[\J
+Kš[J
+K›İÙ\˜Ø\ÙJ
+BˆYˆ
+ˆY˜ÛÛZ[œÊœÙ[™ŠHY˜ÛÛZ[œÊ˜—ÜÙ[™ŠHˆ^OH¹cäz` Hˆ^OHœÙ[™ˆ^˜ÛÛZ[œÊ¹cäz` y­¢9 kÈŠBˆ
+H™]\›ˆYBˆHš[˜[HÂˆÛİ\˜ÙKœ™XŞXÛJ
+BˆBˆBˆ˜[]™[^H]™[^š›Ú[•Ôİš[™ÊˆŠKš[J
+K›İÙ\˜Ø\ÙJ
+Bˆ˜[\ØÜš\[ÛˆH]™[˜ÛÛ[\ØÜš\[ÛËÔİš[™Ê
+K›Ü‘[\J
+Kš[J
+K›İÙ\˜Ø\ÙJ
+Bˆ™]\›ˆ]™[^OH¹cäz` Hˆ]™[^˜ÛÛZ[œÊ¹cäz` y­¢9 kÈŠHˆ\ØÜš\[ÛˆOH¹cäz` Hˆ\ØÜš\[Û‹˜ÛÛZ[œÊ¹cäz` y­¢9 kÈŠBˆB‚ˆš]˜]H[ˆÙÑ]™[
+ÙÎˆİš[™Ë]™[ˆXØÙ\ÜÚXš[]Q]™[
+HÂˆ˜[Ûİ\˜ÙHH]™[œÛİ\˜ÙBˆHÂˆXYÛ›ÜİXÓÙË˜Y
+ˆTQU‘S•‹ˆZ[İš[™ÈÂˆ\[™
+œÙÏIÙÈ\OIÙ]™[˜[YJ]™[™]™[\J_HŠBˆ\[™
+ˆÚ[IÙ]™[Ú[™İÒYHŠBˆ\[™
+ˆœ›ÛOIÙ]™[™œ›ÛR[™^HŠBˆ\[™
+ˆYIÙ]™[˜YYÛİ[HŠBˆ\[™
+ˆ™[[İ™OIÙ]™[œ™[[İ™YÛİ[HŠBˆ\[™
+ˆ™Y›Ü™S[IÙ]™[˜™Y›Ü™U^Ë›[™İÎˆL_HŠBˆ\[™
+ˆ]™[^Ûİ[IÙ]™[^œÚ^™_HŠBˆ\[™
+ˆ]™[^[IÙ]™[^™š\œİÜ“[
+
+OË›[™İÎˆL_HŠBˆ\[™
+ˆÛİ\˜ÙOHŠBˆ\[™
+Yˆ
+Ûİ\˜ÙHOH[
+H›[ˆ[ÙH›ÙTİ[[X\JÛİ\˜ÙJJBˆKˆ
+BˆHš[˜[HÂˆÛİ\˜ÙOËœ™XŞXÛJ
+BˆBˆB‚ˆš]˜]H[ˆ›ÙTİ[[X\J›ÙNˆXØÙ\ÜÚXš[]S›ÙR[™›ÊNˆİš[™ÈÂˆ˜[›İ[™ÈH™Xİ
+
+Bˆ›ÙK™Ù]›İ[™Ò[”ØÜ™Y[Š›İ[™ÊBˆ™]\›ˆZ[İš[™ÈÂˆ\[™
+˜Û\ÜÏIÛ›ÙK˜Û\ÜÓ˜[YOËÔİš[™Ê
+K›Ü‘[\J
+_HŠBˆ\[™
+ˆYIÛ›ÙKšY]ÒY™\Ûİ\˜ÙS˜[YK›Ü‘[\J
+_HŠBˆ\[™
+ˆY]X›OIÛ›ÙKš\ÑY]X›_HŠBˆ\[™
+ˆ›Øİ\ØX›OIÛ›ÙKš\Ñ›Øİ\ØX›_HŠBˆ\[™
+ˆ›Øİ\ÙYIÛ›ÙKš\Ñ›Øİ\ÙYHŠBˆ\[™
+ˆ[˜X›YIÛ›ÙKš\Ñ[˜X›YHŠBˆ\[™
+ˆš\ÚX›OIÛ›ÙKš\Õš\ÚX›UÕ\Ù\ŸHŠBˆ\[™
+ˆ^[IÛ›ÙK^Ë›[™İÎˆL_HŠBˆ\[™
+ˆÙ[IÛ›ÙK^Ù[Xİ[Û”İ\K‹‰Û›ÙK^Ù[Xİ[Û‘[™HŠBˆ\[™
+ˆ›İ[™ÏIØ›İ[™Ë›YK	Ø›İ[™ËÜK	Ø›İ[™ËœšYÚK	Ø›İ[™Ë˜›İÛ_HŠBˆ\[™
+ˆXİ[ÛœÏIÛ›ÙK˜Xİ[Û“\İš›Ú[•Ôİš[™Ê‹ŠHÈ]šYÔİš[™Ê
+H_HŠBˆBˆB‚ˆš]˜]H[ˆ]™[˜[YJ\Nˆ[
+Nˆİš[™ÈHÚ[ˆ
+\JHÂˆXØÙ\ÜÚXš[]Q]™[•TWÕ’QU×ÕVĞÒS‘ÑQOˆ•VĞÒS‘ÑQ‚ˆXØÙ\ÜÚXš[]Q]™[•TWÕ’QU×Ñ“ĞÕTÑQOˆ•’QU×Ñ“ĞÕTÑQ‚ˆXØÙ\ÜÚXš[]Q]™[•TWÕ’QU×ÕVÔÑSPÕSÓ—ĞÒS‘ÑQOˆ”ÑSPÕSÓ—ĞÒS‘ÑQ‚ˆXØÙ\ÜÚXš[]Q]™[•TWÕ’QU×ĞÓPÒÑQOˆ•’QU×ĞÓPÒÑQ‚ˆXØÙ\ÜÚXš[]Q]™[•TWÕÒS‘Õ×ÔÕUWĞÒS‘ÑQOˆ•ÒS‘Õ×ÔÕUWĞÒS‘ÑQ‚ˆXØÙ\ÜÚXš[]Q]™[•TWÕÒS‘Õ×ĞÓÓ•S•ĞÒS‘ÑQOˆ•ÒS‘Õ×ĞÓÓ•S•ĞÒS‘ÑQ‚ˆXØÙ\ÜÚXš[]Q]™[•TWÕÒS‘ÕÔ×ĞÒS‘ÑQOˆ•ÒS‘ÕÔ×ĞÒS‘ÑQ‚ˆ[ÙHOˆ‘U‘S•É\H‚ˆB‚ˆš]˜]H[ˆ™[ØY[\Ê
+HÂˆØXÚY[\ÈH™\ÜÚ]ÜK›ØY[\Ê
+BˆXYÛ›ÜİXÓÙË˜Y
+”•SH‹œİX›KZ[YH™[ØYYÛİ[IØØXÚY[\ËœÚ^™_HŠBˆB‚ˆš]˜]H[ˆ™[ØYÙ][™ÜÊ
+HÂˆ˜[Ù][™ÜÈH\Ù][™ÜÊ\ÊBˆÛÛ\]Xš[]TØØ[‘[˜X›YHÙ][™ÜË˜ÛÛ\]Xš[]TØØ[‘[˜X›YˆØÚÔ™\XÙ[Y[[˜X›YHÙ][™ÜË›ØÚÔ™\XÙ[Y[[˜X›YˆXYÛ›ÜİXÓÙË˜Y
+ˆ”ÑUS‘ÔÈ‹ˆœİX›KZ[YHØØ[IÛÛ\]Xš[]TØØ[‘[˜X›YØÚÏIØÚÔ™\XÙ[Y[[˜X›Y‹ˆ
+BˆYˆ
+[ØÚÔ™\XÙ[Y[[˜X›Y
+HÂˆ›ÙTÙ\ÜÚ[ÛË˜ÛX\“ØÚÊ
+Bˆ[YTÙ\ÜÚ[ÛË˜ÛX\“ØÚÊ
+BˆBˆB‚ˆš]˜]H[ˆØÚY[TØØ[Š[^S\ÎˆÛ™ÊHÂˆ[™\‹œ™[[İ™PØ[˜XÚÜÊ[^YYØØ[”[›˜X›JBˆ[™\‹œÜİ[^YY
+[^YYØØ[”[›˜X›K[^S\ÊBˆB‚ˆİ™\œšYH[ˆÛ’[\œ\
+
+HÂˆÙ\šXÙT[[YTİ]K›X\šÑ\œ›ÜŠ¹ìîùîçú+ ùå*9.¡ˆÛ’[\œ\ŠBˆXYÛ›ÜİXÓÙË˜Y
+”ÑT•’PÑH‹œİX›KZ[YHÛ’[\œ\ŠBˆB‚ˆİ™\œšYH[ˆÛ•[˜š[™
+[[ˆ[™›ÚY˜ÛÛ[’[[ÊNˆ›ÛÛX[ˆÂˆÛX[\
+¹¥è:f§9è£y§#yb¨yaìº)èùîäHŠBˆ™]\›ˆİ\\‹›Û•[˜š[™
+[[
+BˆB‚ˆİ™\œšYH[ˆÛ‘\İ›ŞJ
+HÂˆÛX[\
+¹¥è:f§9è£y§#yb¨ymìºe 9«àHŠBˆİ\\‹›Û‘\İ›ŞJ
+BˆB‚ˆš]˜]H[ˆÛX[\
+™X\ÛÛˆİš[™ÊHÂˆ[™\‹œ™[[İ™PØ[˜XÚÜÊX\™X][›˜X›JBˆ[™\‹œ™[[İ™PØ[˜XÚÜÊ[^YYØØ[”[›˜X›JBˆ[™\‹œ™[[İ™PØ[˜XÚÜÊ[YTÙ]T[›˜X›JBˆYˆ
+\İ[™\”™YÚ\İ\™Y
+HÂˆ™YœË[œ™YÚ\İ\“Û”Ú\™Y™Y™\™[˜ÙPÚ[™ÙS\İ[™\Š™Y™\™[˜ÙS\İ[™\ŠBˆ\İ[™\”™YÚ\İ\™YH˜[ÙBˆBˆ›ÙTÙ\ÜÚ[ÛˆH[ˆ[YTÙ\ÜÚ[ÛˆH[ˆÙ\šXÙT[[YTİ]K›X\šÑ\ØÛÛ›™XİY
+™X\ÛÛŠBˆXYÛ›ÜİXÓÙË˜Y
+”ÑT•’PÑH‹œİX›KZ[YH	™X\ÛÛˆŠBˆB‚ˆš]˜]H]HÛ\ÜÈ\š]™Y^
+ˆ˜[^ˆİš[™Ëˆ˜[ÛÛ™šY[ˆ›ÛÛX[‹ˆ˜[[ÙNˆİš[™Ëˆ˜[˜]Ó[™İˆ[ˆ
+B‚ˆš]˜]H]HÛ\ÜÈ›ÙRÙ^Jˆ˜[Ú[™İÒYˆ[ˆ˜[XÚØYÙS˜[YNˆİš[™Ëˆ˜[šY]ÒYˆİš[™Ëˆ˜[Û\ÜÓ˜[YNˆİš[™Ëˆ˜[›İ[™Îˆİš[™Ëˆ
+B‚ˆš]˜]H]HÛ\ÜÈ[œ]Ù\ÜÚ[ÛŠˆ˜[Ù^Nˆ›ÙRÙ^Kˆ˜\ˆ\İÜš][ˆİš[™ÈHˆ‹ˆ˜\ˆ\İÜš]P]ˆÛ™ÈHˆ˜\ˆØÚĞXİ]™Nˆ›ÛÛX[ˆH˜[ÙKˆ˜\ˆØÚÙY^ˆİš[™ÈHˆ‹ˆ˜\ˆ[İĞÛX\•[[ˆÛ™ÈHˆ˜\ˆÛÛ\ÜÚ][Û•[[ˆÛ™ÈHˆ˜\ˆÛÛ\ÜÚ][Û”[™[™Îˆ›ÛÛX[ˆH˜[ÙKˆ˜\ˆ[YTÙ]T[™[™Îˆ›ÛÛX[ˆH˜[ÙKˆ˜\ˆ[YTÙ]U[[ˆÛ™ÈHˆ˜\ˆ\İØœÙ\™Y]ˆÛ™ÈHˆ
+HÂˆ[ˆÛX\“ØÚÊ
+HÂˆØÚĞXİ]™HH˜[ÙBˆØÚÙY^Hˆ‚ˆB‚ˆ[ˆ[›ØÚÑ›Ü”Ù[™
+
+HÂˆ[İĞÛX\•[[HŞ\İ[K˜İ\œ™[[YSZ[\Ê
+H
+ÈÑS‘ĞÓPT—ÑÔPÑWÓTÂˆÛÛ\ÜÚ][Û•[[HˆÛÛ\ÜÚ][Û”[™[™ÈH˜[ÙBˆ[YTÙ]T[™[™ÈH˜[ÙBˆ[YTÙ]U[[HˆÛX\“ØÚÊ
+BˆBˆB‚ˆš]˜]HÛÛ\[š[ÛˆØš™XİÂˆÛÛœİ˜[QÈH•\[™Ô™\XÙ\”İX›R[YH‚ˆÛÛœİ˜[ÑS—ÕÔ’UWÑÕPT‘ÓTÈHLŒˆÛÛœİ˜[ÓÓTUP’SUWÔĞĞS—ÒS•T•SÓTÈHLˆÛÛœİ˜[ÑS‘ĞÓPT—ÑÔPÑWÓTÈHNˆÛÛœİ˜[ÓÓ•S•ÔĞĞS—Õ“ÕWÓTÈHˆÛÛœİ˜[ÓÓ•S•ÔĞĞS—ÑSVWÓTÈHLŒˆÛÛœİ˜[VÑSPÒ×ÔĞĞS—ÑSVWÓTÈHÌˆÛÛœİ˜[“ĞÕT×ÔĞĞS—ÑSVWÓTÈHˆÛÛœİ˜[ÓPÒ×ÔĞĞS—ÑSVWÓTÈHLˆÛÛœİ˜[ÒS‘Õ×ÔĞĞS—ÑSVWÓTÈHMˆÛÛœİ˜[PVÕ‘QWÑTHˆÛÛœİ˜[RS—ÑQUP“WĞĞS‘QUWÔĞÓÔ‘HHˆÛÛœİ˜[SQT×ÔÖS•UP×ÕÒS‘Õ×ÒQHLŒ‚ˆËÈSQK[Û›HY]ÜœÈ˜YHHÛX[[[İ[Ùˆ][˜ŞH›ÜˆÛÜœ™Xİ™\ÜËˆHÚ[™ÛBˆËÈX[X[Y]Ù]\È]ZXÚÛNÈ˜]ÚØÛÛ\ÜÚ[™ËÜÜYXÚY]ÈØZ]Û™Ù\‹‚ˆÛÛœİ˜[SQWÔÒS‘ÓWÑQUÔÑUWÓTÈHLˆÛÛœİ˜[SQWĞÓÓTÔÒS‘×ÔÑUWÓTÈHLLˆÛÛœİ˜[SQT×ĞUÒĞQÓRSˆH‚ˆÛÛœİ˜[SQWĞUÒÔ‘SSÕ‘WÓRSˆHˆÛÛœİ˜[PVÓPS•PSÓĞÒ×ÑSUWĞÒT”ÈHˆBŸB
