@@ -20,6 +20,9 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.max
 
 class MainActivity : Activity() {
@@ -33,6 +36,8 @@ class MainActivity : Activity() {
     private lateinit var diagnosticLogView: TextView
     private lateinit var compatibilityScanCheck: CheckBox
     private lateinit var lockReplacementCheck: CheckBox
+
+    private var pendingDiagnosticExport = ""
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val refreshRunnable = object : Runnable {
@@ -59,6 +64,33 @@ class MainActivity : Activity() {
     override fun onPause() {
         uiHandler.removeCallbacks(refreshRunnable)
         super.onPause()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_EXPORT_DIAGNOSTIC || resultCode != RESULT_OK) return
+
+        val uri = data?.data ?: return
+        val report = pendingDiagnosticExport
+        pendingDiagnosticExport = ""
+        if (report.isBlank()) {
+            Toast.makeText(this, "没有可导出的诊断报告", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        try {
+            contentResolver.openOutputStream(uri, "w")?.bufferedWriter(Charsets.UTF_8).use { writer ->
+                requireNotNull(writer) { "无法打开导出文件" }
+                writer.write(report)
+            }
+            Toast.makeText(this, "诊断报告 TXT 已导出", Toast.LENGTH_SHORT).show()
+        } catch (t: Throwable) {
+            Toast.makeText(
+                this,
+                "导出失败：${t.javaClass.simpleName}",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
     }
 
     private fun buildContentView(): View {
@@ -116,7 +148,7 @@ class MainActivity : Activity() {
             setPadding(0, 24, 0, 6)
         })
         root.addView(TextView(this).apply {
-            text = "轻量统计始终运行且不记录聊天正文。需要排查时先开始诊断，再正常使用微信/其他 App，最后结束并复制报告。"
+            text = "轻量统计始终运行且不记录聊天正文。需要排查时先开始诊断，再正常使用微信/其他 App，最后结束并复制或导出报告。"
             textSize = 12f
             setPadding(0, 0, 0, 8)
         })
@@ -142,6 +174,11 @@ class MainActivity : Activity() {
         root.addView(Button(this).apply {
             text = "复制当前诊断报告"
             setOnClickListener { copyDiagnosticReport() }
+        })
+
+        root.addView(Button(this).apply {
+            text = "导出诊断报告 TXT"
+            setOnClickListener { exportDiagnosticReport() }
         })
 
         root.addView(Button(this).apply {
@@ -211,9 +248,9 @@ class MainActivity : Activity() {
         return scroll
     }
 
-    private fun copyDiagnosticReport() {
+    private fun buildDiagnosticReport(): String {
         val rules = repository.loadRules()
-        val report = DiagnosticMetrics.buildReport(
+        return DiagnosticMetrics.buildReport(
             context = this,
             ruleCount = rules.count { it.enabled && it.source.isNotEmpty() },
             compatibilityScan = appSettings.compatibilityScanEnabled,
@@ -221,9 +258,33 @@ class MainActivity : Activity() {
             verboseTrace = DiagnosticLog.isVerbose(),
             trace = DiagnosticLog.snapshot(),
         )
+    }
+
+    private fun copyDiagnosticReport() {
+        val report = buildDiagnosticReport()
         val clipboard = getSystemService(ClipboardManager::class.java)
         clipboard.setPrimaryClip(ClipData.newPlainText("typing-replacer-diagnostic-report", report))
         Toast.makeText(this, "完整诊断报告已复制", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun exportDiagnosticReport() {
+        pendingDiagnosticExport = buildDiagnosticReport()
+        val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TITLE, "typing-replacer-diagnostic-$timestamp.txt")
+        }
+        try {
+            startActivityForResult(intent, REQUEST_EXPORT_DIAGNOSTIC)
+        } catch (t: Throwable) {
+            pendingDiagnosticExport = ""
+            Toast.makeText(
+                this,
+                "无法打开文件保存界面：${t.javaClass.simpleName}",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
     }
 
     private fun openBatteryCompatibilitySettings() {
@@ -342,5 +403,9 @@ class MainActivity : Activity() {
         return enabledServices.split(':').any {
             it.equals(fullName, ignoreCase = true) || it.equals(shortName, ignoreCase = true)
         }
+    }
+
+    private companion object {
+        const val REQUEST_EXPORT_DIAGNOSTIC = 4201
     }
 }
