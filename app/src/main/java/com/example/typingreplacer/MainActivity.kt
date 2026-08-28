@@ -1,6 +1,8 @@
 package com.example.typingreplacer
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -28,6 +30,7 @@ class MainActivity : Activity() {
     private lateinit var ruleContainer: LinearLayout
     private lateinit var serviceStatus: TextView
     private lateinit var diagnostics: TextView
+    private lateinit var diagnosticLogView: TextView
     private lateinit var compatibilityScanCheck: CheckBox
     private lateinit var lockReplacementCheck: CheckBox
 
@@ -124,6 +127,49 @@ class MainActivity : Activity() {
             textSize = 13f
             setPadding(0, 6, 0, 10)
         })
+
+        root.addView(TextView(this).apply {
+            text = "微信诊断日志"
+            textSize = 18f
+            setPadding(0, 24, 0, 6)
+        })
+
+        root.addView(TextView(this).apply {
+            text = "日志不保存聊天正文，只记录节点类型、资源 ID、焦点/编辑状态、文本长度和系统动作结果。测试微信后点“复制诊断日志”发给我。"
+            textSize = 12f
+            setPadding(0, 0, 0, 6)
+        })
+
+        root.addView(Button(this).apply {
+            text = "复制诊断日志"
+            setOnClickListener {
+                val text = DiagnosticLog.snapshot()
+                val clipboard = getSystemService(ClipboardManager::class.java)
+                clipboard.setPrimaryClip(ClipData.newPlainText("typing-replacer-log", text))
+                Toast.makeText(
+                    this@MainActivity,
+                    if (text.isBlank()) "当前没有日志" else "诊断日志已复制",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        })
+
+        root.addView(Button(this).apply {
+            text = "清空诊断日志"
+            setOnClickListener {
+                DiagnosticLog.clear()
+                diagnosticLogView.text = "暂无日志"
+                Toast.makeText(this@MainActivity, "日志已清空", Toast.LENGTH_SHORT).show()
+            }
+        })
+
+        diagnosticLogView = TextView(this).apply {
+            text = "暂无日志"
+            textSize = 11f
+            setTextIsSelectable(true)
+            setPadding(0, 6, 0, 16)
+        }
+        root.addView(diagnosticLogView)
 
         root.addView(TextView(this).apply {
             text = "测试区"
@@ -242,6 +288,9 @@ class MainActivity : Activity() {
             )
             if (snapshot.lastError.isNotEmpty()) append("最近错误：${snapshot.lastError}")
         }.trim()
+
+        val logText = DiagnosticLog.snapshot(80)
+        diagnosticLogView.text = if (logText.isBlank()) "暂无日志" else logText
     }
 
     private fun packageSuffix(packageName: String): String =
