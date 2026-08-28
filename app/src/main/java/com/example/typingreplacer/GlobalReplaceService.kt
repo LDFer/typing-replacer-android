@@ -1040,7 +1040,7 @@ class GlobalReplaceService : AccessibilityService() {
         const val MIN_EDITABLE_CANDIDATE_SCORE = 80
         const val IME_SYNTHETIC_WINDOW_ID = -2000
 
-        const val COMPOSITION_GRACE_MS = 1200L
+        const val COMPOSITION_GRACE_MS = 650L
         const val COMPOSING_LARGE_EDIT_MIN = 8
         const val MAX_MANUAL_LOCK_DELETE_CHARS = 8
     }
